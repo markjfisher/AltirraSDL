@@ -563,6 +563,39 @@ if(NOT WIN32)
 endif()
 
 # ---------------------------------------------------------------------------
+# FujiNet-NIO embedded SIO device POC
+# ---------------------------------------------------------------------------
+# This keeps the native AltirraSDL device opt-in for normal standalone
+# checkouts, but auto-enables in the fujinet-nio workspace where the sibling
+# source tree is present.
+set(_ALTIRRA_FUJINET_NIO_DEFAULT OFF)
+if(EXISTS "${CMAKE_SOURCE_DIR}/../fujinet-nio/CMakeLists.txt")
+    set(_ALTIRRA_FUJINET_NIO_DEFAULT ON)
+endif()
+option(ALTIRRA_FUJINET_NIO "Build embedded FujiNet-NIO SIO device POC" ${_ALTIRRA_FUJINET_NIO_DEFAULT})
+set(ALTIRRA_FUJINET_NIO_SOURCE_DIR "${CMAKE_SOURCE_DIR}/../fujinet-nio" CACHE PATH "Path to fujinet-nio source tree")
+
+if(ALTIRRA_FUJINET_NIO)
+    if(EXISTS "${ALTIRRA_FUJINET_NIO_SOURCE_DIR}/CMakeLists.txt")
+        set(FN_BUILD_POSIX_APP OFF CACHE BOOL "Build POSIX console application" FORCE)
+        set(FN_BUILD_TESTS OFF CACHE BOOL "Build fujinet-nio tests" FORCE)
+        set(FN_WITH_CURL OFF CACHE BOOL "Enable libcurl-backed HTTP/HTTPS on POSIX" FORCE)
+        set(FN_WITH_OPENSSL OFF CACHE BOOL "Enable OpenSSL-backed TLS on POSIX" FORCE)
+        set(FN_BUILD_FUJIBUS_PTY ON CACHE BOOL "Build for FUJIBUS PTY profile" FORCE)
+
+        add_subdirectory("${ALTIRRA_FUJINET_NIO_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/fujinet-nio" EXCLUDE_FROM_ALL)
+
+        target_sources(AltirraSDL PRIVATE
+            source/devices/fujinetnio.cpp
+        )
+        target_compile_definitions(AltirraSDL PRIVATE ALTIRRA_FUJINET_NIO=1)
+        target_link_libraries(AltirraSDL PRIVATE fujinet-nio)
+    else()
+        message(WARNING "ALTIRRA_FUJINET_NIO is ON but ALTIRRA_FUJINET_NIO_SOURCE_DIR does not contain fujinet-nio; embedded device disabled.")
+    endif()
+endif()
+
+# ---------------------------------------------------------------------------
 # Window/taskbar icon
 # ---------------------------------------------------------------------------
 # Bake the Android launcher PNGs into:

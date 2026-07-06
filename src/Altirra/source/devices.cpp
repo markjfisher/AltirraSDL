@@ -38,6 +38,9 @@ extern const ATDeviceDefinition g_ATDeviceDefXEP80;
 extern const ATDeviceDefinition g_ATDeviceDefSlightSID;
 extern const ATDeviceDefinition g_ATDeviceDefDragonCart;
 extern const ATDeviceDefinition g_ATDeviceDefSIOClock;
+#if defined(ALTIRRA_FUJINET_NIO)
+extern const ATDeviceDefinition g_ATDeviceDefFujiNetNIO;
+#endif
 extern const ATDeviceDefinition g_ATDeviceDefTestSIOPoll3;
 extern const ATDeviceDefinition g_ATDeviceDefTestSIOPoll4;
 extern const ATDeviceDefinition g_ATDeviceDefTestSIOHighSpeed;
@@ -147,6 +150,9 @@ void ATRegisterDevices(ATDeviceManager& dm) {
 		&g_ATDeviceDefSlightSID,
 		&g_ATDeviceDefDragonCart,
 		&g_ATDeviceDefSIOClock,
+#if defined(ALTIRRA_FUJINET_NIO)
+		&g_ATDeviceDefFujiNetNIO,
+#endif
 		&g_ATDeviceDefTestSIOPoll3,
 		&g_ATDeviceDefTestSIOPoll4,
 		&g_ATDeviceDefTestSIOHighSpeed,

@@ -200,6 +200,9 @@ static const DeviceCatalogEntry kSIODevices[] = {
 	{ "sioserial",      "SIO serial adapter", "SIO bus to traditional serial port adapter (SIO2PC-like)." },
 	{ "sio2sd",         "SIO2SD", "Hardware disk emulator using SD card images." },
 	{ "sioclock",       "SIO Real-Time Clock", "Implements APE, AspeQt, and SIO2USB RTC protocols." },
+#if defined(ALTIRRA_FUJINET_NIO)
+	{ "fujinetnio",     "FujiNet-NIO", "Embeds FujiNet-NIO as a native SIO FujiBus device." },
+#endif
 	{ "sx212",          "SX212 Modem", "1200 baud SIO modem." },
 	{ "testsiopoll3",   "SIO Type 3 Poll Test Device", "Test device for XL/XE boot-time handler auto-load." },
 	{ "testsiopoll4",   "SIO Type 4 Poll Test Device", "Test device for XL/XE on-demand handler auto-load." },
