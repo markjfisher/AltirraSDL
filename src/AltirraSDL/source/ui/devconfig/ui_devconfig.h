@@ -97,6 +97,7 @@ bool RenderMyIDE2Config(ATPropertySet& props, ATDeviceConfigState& st);
 bool RenderHDVirtFATConfig(ATPropertySet& props, ATDeviceConfigState& st);
 bool RenderPCLinkConfig(ATPropertySet& props, ATDeviceConfigState& st);
 bool RenderHostFSConfig(ATPropertySet& props, ATDeviceConfigState& st);
+bool RenderFujiNetNIOConfig(ATPropertySet& props, ATDeviceConfigState& st);
 bool RenderCustomDeviceConfig(ATPropertySet& props, ATDeviceConfigState& st);
 bool RenderComputerEyesConfig(ATPropertySet& props, ATDeviceConfigState& st);
 bool RenderVideoStillImageConfig(ATPropertySet& props, ATDeviceConfigState& st);

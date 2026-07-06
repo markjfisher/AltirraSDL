@@ -8,6 +8,7 @@
 #include <stdafx.h>
 #include <at/atcore/deviceimpl.h>
 #include <at/atcore/devicesioimpl.h>
+#include <at/atcore/propertyset.h>
 
 #include "fujinet/build/profile.h"
 #include "fujinet/config/fuji_config.h"
@@ -24,10 +25,15 @@
 #include "fujinet/platform/posix/fs_factory.h"
 
 #include <algorithm>
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <memory>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -37,10 +43,12 @@ static constexpr const char *kTag = "altirra-fn";
 class AltirraFujiBusChannel final : public fujinet::io::Channel {
 public:
 	bool available() override {
+		std::lock_guard<std::mutex> lock(mMutex);
 		return !mRx.empty();
 	}
 
 	std::size_t read(std::uint8_t *buffer, std::size_t maxLen) override {
+		std::lock_guard<std::mutex> lock(mMutex);
 		if (!buffer || maxLen == 0 || mRx.empty())
 			return 0;
 
@@ -51,6 +59,7 @@ public:
 	}
 
 	void write(const std::uint8_t *buffer, std::size_t len) override {
+		std::lock_guard<std::mutex> lock(mMutex);
 		if (!buffer || len == 0)
 			return;
 
@@ -58,12 +67,14 @@ public:
 	}
 
 	void PushRequest(const void *data, std::size_t len) {
+		std::lock_guard<std::mutex> lock(mMutex);
 		const auto *bytes = static_cast<const std::uint8_t *>(data);
 		if (bytes && len)
 			mRx.insert(mRx.end(), bytes, bytes + len);
 	}
 
 	std::vector<std::uint8_t> TakeResponse(std::size_t len) {
+		std::lock_guard<std::mutex> lock(mMutex);
 		std::vector<std::uint8_t> out(len);
 		const std::size_t n = std::min(len, mTx.size());
 		if (n) {
@@ -74,14 +85,22 @@ public:
 	}
 
 	bool HasResponse() const {
+		std::lock_guard<std::mutex> lock(mMutex);
 		return !mTx.empty();
 	}
 
+	bool HasRequest() const {
+		std::lock_guard<std::mutex> lock(mMutex);
+		return !mRx.empty();
+	}
+
 	void ClearPendingWrite() {
+		std::lock_guard<std::mutex> lock(mMutex);
 		mRx.clear();
 	}
 
 private:
+	mutable std::mutex mMutex;
 	std::vector<std::uint8_t> mRx;
 	std::vector<std::uint8_t> mTx;
 };
@@ -89,9 +108,13 @@ private:
 class ATDeviceFujiNetNIO final : public ATDevice, public ATDeviceSIO {
 public:
 	ATDeviceFujiNetNIO();
+	~ATDeviceFujiNetNIO();
 
 	void *AsInterface(uint32 id) override;
 	void GetDeviceInfo(ATDeviceInfo& info) override;
+	void GetSettingsBlurb(VDStringW& buf) override;
+	void GetSettings(ATPropertySet& settings) override;
+	bool SetSettings(const ATPropertySet& settings) override;
 	void Shutdown() override;
 
 	void InitSIO(IATDeviceSIOManager *siomgr) override;
@@ -104,11 +127,14 @@ public:
 private:
 	static constexpr uint32 kReceiveIdWrite = 1;
 	static constexpr uint32 kFenceIdProcessWrite = 2;
+	static constexpr uint32 kFenceIdSendRead = 3;
 	static constexpr std::uint8_t kNioSioDevice = 0x7F;
 	static constexpr std::uint8_t kNetSioNetworkDevice = 0x71;
 	static constexpr std::uint8_t kWriteCommand = 'W';
 	static constexpr std::uint8_t kReadCommand = 'R';
 	static constexpr uint32 kDefaultReadSize = 768;
+	static constexpr uint32 kReadRetryDelayCycles = 1800;
+	static constexpr uint32 kReadMaxRetries = 10000;
 
 	static bool IsNioSioDevice(std::uint8_t device) {
 		return device == kNioSioDevice || device == kNetSioNetworkDevice;
@@ -127,41 +153,53 @@ private:
 	}
 
 	bool InitCore();
-	void PumpCore();
+	void StartWorker();
+	void StopWorker();
+	void WorkerLoop();
 	CmdResponse BeginWriteCommand(const ATDeviceSIOCommand& cmd, uint32 len);
 	CmdResponse BeginReadCommand(const ATDeviceSIOCommand& cmd, uint32 len);
 	CmdResponse BeginCommand(const ATDeviceSIOCommand& cmd, uint32 explicitLength);
 	void ProcessPendingWrite();
+	void SendReadResponseOrRetry();
 
 	IATDeviceSIOManager *mpSIOMgr = nullptr;
 	vdrefptr<IATDeviceSIOInterface> mpSIOInterface;
 	fujinet::core::FujinetCore mCore;
 	AltirraFujiBusChannel mChannel;
+	VDStringW mConfigDir{L"./fujinet-data"};
 	bool mbCoreReady = false;
 	bool mbPendingWrite = false;
 	bool mbPendingWriteChecksumOK = false;
+	uint32 mPendingReadSize = 0;
+	uint32 mPendingReadRetries = 0;
 	std::vector<std::uint8_t> mPendingWrite;
+	std::mutex mWorkerMutex;
+	std::condition_variable mWorkerCv;
+	std::thread mWorker;
+	bool mbWorkerStop = false;
 };
 
 } // namespace
 
 void ATCreateDeviceFujiNetNIO(const ATPropertySet& pset, IATDevice **dev) {
-	(void)pset;
-
 	vdrefptr<ATDeviceFujiNetNIO> p(new ATDeviceFujiNetNIO);
+	p->SetSettings(pset);
 	*dev = p.release();
 }
 
 extern const ATDeviceDefinition g_ATDeviceDefFujiNetNIO = {
 	"fujinetnio",
-	nullptr,
+	"fujinetnio",
 	L"FujiNet-NIO",
 	ATCreateDeviceFujiNetNIO
 };
 
 ATDeviceFujiNetNIO::ATDeviceFujiNetNIO() {
 	SetSaveStateAgnostic();
-	mbCoreReady = InitCore();
+}
+
+ATDeviceFujiNetNIO::~ATDeviceFujiNetNIO() {
+	StopWorker();
 }
 
 void *ATDeviceFujiNetNIO::AsInterface(uint32 id) {
@@ -178,7 +216,25 @@ void ATDeviceFujiNetNIO::GetDeviceInfo(ATDeviceInfo& info) {
 	info.mpDef = &g_ATDeviceDefFujiNetNIO;
 }
 
+void ATDeviceFujiNetNIO::GetSettingsBlurb(VDStringW& buf) {
+	buf += mConfigDir;
+}
+
+void ATDeviceFujiNetNIO::GetSettings(ATPropertySet& settings) {
+	settings.SetString("configdir", mConfigDir.c_str());
+}
+
+bool ATDeviceFujiNetNIO::SetSettings(const ATPropertySet& settings) {
+	const VDStringW newConfigDir(settings.GetString("configdir", L"./fujinet-data"));
+	if (mbCoreReady && newConfigDir != mConfigDir) {
+		FN_LOGW(kTag, "configdir changes take effect after removing and re-adding the device");
+	}
+	mConfigDir = newConfigDir;
+	return true;
+}
+
 void ATDeviceFujiNetNIO::Shutdown() {
+	StopWorker();
 	mpSIOInterface = nullptr;
 	mpSIOMgr = nullptr;
 }
@@ -186,6 +242,11 @@ void ATDeviceFujiNetNIO::Shutdown() {
 void ATDeviceFujiNetNIO::InitSIO(IATDeviceSIOManager *siomgr) {
 	mpSIOMgr = siomgr;
 	mpSIOInterface = mpSIOMgr->AddDevice(this);
+	if (!mbCoreReady) {
+		mbCoreReady = InitCore();
+		if (mbCoreReady)
+			StartWorker();
+	}
 }
 
 IATDeviceSIO::CmdResponse ATDeviceFujiNetNIO::OnSerialBeginCommand(const ATDeviceSIOCommand& cmd) {
@@ -211,20 +272,29 @@ void ATDeviceFujiNetNIO::OnSerialReceiveComplete(uint32 id, const void *data, ui
 }
 
 void ATDeviceFujiNetNIO::OnSerialFence(uint32 id) {
-	if (id != kFenceIdProcessWrite)
-		return;
-
-	ProcessPendingWrite();
+	if (id == kFenceIdProcessWrite)
+		ProcessPendingWrite();
+	else if (id == kFenceIdSendRead)
+		SendReadResponseOrRetry();
 }
 
 IATDeviceSIO::CmdResponse ATDeviceFujiNetNIO::OnSerialAccelCommand(const ATDeviceSIORequest& request) {
-	return BeginCommand(request, request.mLength);
+	(void)request;
+	return kCmdResponse_BypassAccel;
 }
 
 bool ATDeviceFujiNetNIO::InitCore() {
 	using namespace fujinet::io::protocol;
 
-	auto hostFs = fujinet::platform::posix::create_host_filesystem("./fujinet-data");
+	const VDStringA configDir = VDTextWToU8(mConfigDir);
+	std::error_code ec;
+	std::filesystem::create_directories(configDir.c_str(), ec);
+	if (ec) {
+		FN_LOGE(kTag, "failed to create config directory '%s': %s", configDir.c_str(), ec.message().c_str());
+		return false;
+	}
+
+	auto hostFs = fujinet::platform::posix::create_host_filesystem(configDir.c_str());
 	if (!hostFs || !mCore.storageManager().registerFileSystem(std::move(hostFs))) {
 		FN_LOGE(kTag, "failed to register host filesystem");
 		return false;
@@ -292,11 +362,41 @@ bool ATDeviceFujiNetNIO::InitCore() {
 	return true;
 }
 
-void ATDeviceFujiNetNIO::PumpCore() {
-	for(int i = 0; i < 16; ++i) {
+void ATDeviceFujiNetNIO::StartWorker() {
+	std::lock_guard<std::mutex> lock(mWorkerMutex);
+	if (mWorker.joinable())
+		return;
+
+	mbWorkerStop = false;
+	mWorker = std::thread([this] {
+		WorkerLoop();
+	});
+}
+
+void ATDeviceFujiNetNIO::StopWorker() {
+	{
+		std::lock_guard<std::mutex> lock(mWorkerMutex);
+		mbWorkerStop = true;
+	}
+	mWorkerCv.notify_all();
+
+	if (mWorker.joinable())
+		mWorker.join();
+}
+
+void ATDeviceFujiNetNIO::WorkerLoop() {
+	for(;;) {
+		{
+			std::unique_lock<std::mutex> lock(mWorkerMutex);
+			mWorkerCv.wait_for(lock, std::chrono::milliseconds(1), [this] {
+				return mbWorkerStop || mChannel.HasRequest();
+			});
+
+			if (mbWorkerStop)
+				break;
+		}
+
 		mCore.tick();
-		if (mChannel.HasResponse())
-			break;
 	}
 }
 
@@ -317,14 +417,12 @@ IATDeviceSIO::CmdResponse ATDeviceFujiNetNIO::BeginReadCommand(const ATDeviceSIO
 	(void)cmd;
 
 	const uint32 transferSize = len ? len : kDefaultReadSize;
-	PumpCore();
-	auto response = mChannel.TakeResponse(transferSize);
+	mPendingReadSize = transferSize;
+	mPendingReadRetries = 0;
 
 	mpSIOInterface->BeginCommand();
 	mpSIOInterface->SendACK();
-	mpSIOInterface->SendComplete();
-	mpSIOInterface->SendData(response.data(), transferSize, true);
-	mpSIOInterface->EndCommand();
+	mpSIOInterface->InsertFence(kFenceIdSendRead);
 	return kCmdResponse_Start;
 }
 
@@ -366,7 +464,7 @@ void ATDeviceFujiNetNIO::ProcessPendingWrite() {
 	}
 
 	mChannel.PushRequest(mPendingWrite.data(), mPendingWrite.size());
-	PumpCore();
+	mWorkerCv.notify_one();
 
 	mbPendingWrite = false;
 	mbPendingWriteChecksumOK = false;
@@ -374,4 +472,29 @@ void ATDeviceFujiNetNIO::ProcessPendingWrite() {
 
 	mpSIOInterface->SendComplete();
 	mpSIOInterface->EndCommand();
+}
+
+void ATDeviceFujiNetNIO::SendReadResponseOrRetry() {
+	if (mChannel.HasResponse()) {
+		auto response = mChannel.TakeResponse(mPendingReadSize);
+		mpSIOInterface->SendComplete();
+		mpSIOInterface->SendData(response.data(), mPendingReadSize, true);
+		mpSIOInterface->EndCommand();
+		mPendingReadSize = 0;
+		mPendingReadRetries = 0;
+		return;
+	}
+
+	if (++mPendingReadRetries > kReadMaxRetries) {
+		FN_LOGW(kTag, "timed out waiting for FujiBus response");
+		mpSIOInterface->SendError();
+		mpSIOInterface->EndCommand();
+		mPendingReadSize = 0;
+		mPendingReadRetries = 0;
+		return;
+	}
+
+	mWorkerCv.notify_one();
+	mpSIOInterface->Delay(kReadRetryDelayCycles);
+	mpSIOInterface->InsertFence(kFenceIdSendRead);
 }

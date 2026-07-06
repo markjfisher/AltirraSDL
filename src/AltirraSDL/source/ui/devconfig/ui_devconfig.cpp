@@ -261,6 +261,9 @@ static bool DispatchDeviceDialog(const char *tag, ATPropertySet& props, ATDevice
 	if (!strcmp(tag, "pclink")) return RenderPCLinkConfig(props, st);
 	if (!strcmp(tag, "hostfs")) return RenderHostFSConfig(props, st);
 
+	// FujiNet-NIO
+	if (!strcmp(tag, "fujinetnio")) return RenderFujiNetNIOConfig(props, st);
+
 	// Custom device
 	if (!strcmp(tag, "custom")) return RenderCustomDeviceConfig(props, st);
 
