@@ -606,9 +606,9 @@ if(ALTIRRA_FUJINET_NIO)
     if(EXISTS "${ALTIRRA_FUJINET_NIO_SOURCE_DIR}/CMakeLists.txt")
         set(FN_BUILD_POSIX_APP OFF CACHE BOOL "Build POSIX console application" FORCE)
         set(FN_BUILD_TESTS OFF CACHE BOOL "Build fujinet-nio tests" FORCE)
-        set(FN_WITH_CURL OFF CACHE BOOL "Enable libcurl-backed HTTP/HTTPS on POSIX" FORCE)
-        set(FN_WITH_OPENSSL OFF CACHE BOOL "Enable OpenSSL-backed TLS on POSIX" FORCE)
-        set(FN_BUILD_FUJIBUS_PTY ON CACHE BOOL "Build for FUJIBUS PTY profile" FORCE)
+        set(FN_BUILD_EMBEDDED_LIB ON CACHE BOOL "Build reduced POSIX library surface for embedders" FORCE)
+        set(FN_WITH_CURL ON CACHE BOOL "Enable libcurl-backed HTTP/HTTPS on POSIX" FORCE)
+        set(FN_WITH_OPENSSL ON CACHE BOOL "Enable OpenSSL-backed TLS on POSIX" FORCE)
 
         add_subdirectory("${ALTIRRA_FUJINET_NIO_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/fujinet-nio" EXCLUDE_FROM_ALL)
 
