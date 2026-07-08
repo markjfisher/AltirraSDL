@@ -133,6 +133,7 @@ private:
 	static constexpr std::uint8_t kWriteCommand = 'W';
 	static constexpr std::uint8_t kReadCommand = 'R';
 	static constexpr uint32 kDefaultReadSize = 768;
+	static constexpr uint32 kCommandAckDelayCycles = 1800;
 	static constexpr uint32 kReadRetryDelayCycles = 1800;
 	static constexpr uint32 kReadMaxRetries = 10000;
 
@@ -407,6 +408,7 @@ IATDeviceSIO::CmdResponse ATDeviceFujiNetNIO::BeginWriteCommand(const ATDeviceSI
 		return kCmdResponse_Fail_NAK;
 
 	mpSIOInterface->BeginCommand();
+	mpSIOInterface->Delay(kCommandAckDelayCycles);
 	mpSIOInterface->SendACK();
 	mpSIOInterface->ReceiveData(kReceiveIdWrite, len, true);
 	mpSIOInterface->InsertFence(kFenceIdProcessWrite);
@@ -421,6 +423,7 @@ IATDeviceSIO::CmdResponse ATDeviceFujiNetNIO::BeginReadCommand(const ATDeviceSIO
 	mPendingReadRetries = 0;
 
 	mpSIOInterface->BeginCommand();
+	mpSIOInterface->Delay(kCommandAckDelayCycles);
 	mpSIOInterface->SendACK();
 	mpSIOInterface->InsertFence(kFenceIdSendRead);
 	return kCmdResponse_Start;
