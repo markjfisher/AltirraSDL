@@ -16,7 +16,7 @@
 #include "fujinet/core/core.h"
 #include "fujinet/core/device_init.h"
 #include "fujinet/core/logging.h"
-#include "fujinet/fs/mount_applier.h"
+#include "fujinet/fs/boot_mount.h"
 #include "fujinet/io/core/channel.h"
 #include "fujinet/io/devices/disk_device.h"
 #include "fujinet/io/devices/fuji_device.h"
@@ -350,11 +350,22 @@ bool ATDeviceFujiNetNIO::InitCore() {
 	const auto diskDeviceId = to_device_id(WireDeviceId::DiskService);
 	auto *diskDev = dynamic_cast<fujinet::io::DiskDevice *>(mCore.deviceManager().getDevice(diskDeviceId));
 	if (diskDev) {
-		const std::size_t applied = fujinet::apply_config_mounts(
-			diskDev->disk_service(),
-			mCore.storageManager(),
-			config.mounts);
-		FN_LOGI(kTag, "applied %zu config mount(s)", applied);
+		constexpr std::size_t activeBootDiskUnit = 0;
+		if (config.boot.mode == fujinet::config::BootMode::Config)
+			diskDev->configure_boot_mount(config.boot.configUri, config.boot.readOnly);
+
+		const auto restoredRuntimeSlots = diskDev->restore_runtime_mounts();
+		const bool bootUnitRestored =
+			std::find(restoredRuntimeSlots.begin(), restoredRuntimeSlots.end(),
+				activeBootDiskUnit) != restoredRuntimeSlots.end();
+		const std::size_t bootApplied = bootUnitRestored ? 0 :
+			fujinet::apply_boot_mount(
+				diskDev->disk_service(),
+				mCore.storageManager(),
+				config.boot,
+				activeBootDiskUnit);
+		FN_LOGI(kTag, "restored %zu runtime mount(s), applied %zu boot mount",
+			restoredRuntimeSlots.size(), bootApplied);
 	}
 
 	fujinet::core::register_network_device(mCore);
