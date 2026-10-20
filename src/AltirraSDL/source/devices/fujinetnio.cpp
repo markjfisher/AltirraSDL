@@ -321,7 +321,7 @@ bool ATDeviceFujiNetNIO::InitCore() {
 
 	fujinet::build::BuildProfile profile{
 		fujinet::build::Machine::Atari8Bit,
-		fujinet::build::TransportKind::FujiBus,
+		fujinet::build::TransportKind::FujiBusSlip,
 		fujinet::build::ChannelKind::SioGpio,
 		"AltirraSDL embedded FujiNet-NIO",
 		{}
@@ -368,7 +368,7 @@ bool ATDeviceFujiNetNIO::InitCore() {
 			restoredRuntimeSlots.size(), bootApplied);
 	}
 
-	fujinet::core::register_network_device(mCore);
+	fujinet::core::register_network_device(mCore, config.translation);
 	fujinet::core::register_modem_device(mCore);
 	fujinet::core::setup_transports(mCore, mChannel, profile, &config);
 	return true;
