@@ -160,6 +160,16 @@ void ExpectStatus(const FakeSIO& sio, const std::vector<std::uint8_t>& bytes, co
 		Fail(message);
 }
 
+void ExpectEvents(const FakeSIO& sio, std::initializer_list<const char *> expected, const char *message) {
+	if (sio.events.size() != expected.size())
+		Fail(message);
+	std::size_t index = 0;
+	for (const char *event : expected) {
+		if (sio.events[index++] != event)
+			Fail(message);
+	}
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -192,6 +202,7 @@ int main(int argc, char **argv) {
 		"Q command checksum matches canonical fixture");
 	Check(sioDevice->OnSerialBeginCommand(q) == IATDeviceSIO::kCmdResponse_Start, "Q starts");
 	ExpectStatus(sio, {'A', 'C', 1, 0, 2, 0, 0x03}, "Q emits exact native reply");
+	ExpectEvents(sio, {"begin", "delay", "A", "C", "data", "end"}, "Q scheduling order is exact");
 
 	// $71 is not a native alias and must never claim the SIO transaction.
 	sio.Clear();
@@ -209,6 +220,7 @@ int main(int argc, char **argv) {
 	Check(sioDevice->OnSerialBeginCommand(Command(0x7f, 'W', request.size())) == IATDeviceSIO::kCmdResponse_Start,
 		"W starts");
 	ExpectStatus(sio, {'A'}, "W initial ACK is exact");
+	ExpectEvents(sio, {"begin", "delay", "A", "receive", "fence"}, "W receive scheduling order is exact");
 	Check(sio.receiveId == 1 && sio.fenceId == 2 &&
 		sio.receiveLength == request.size() + 1 && !sio.receiveAutoProtocol,
 		"W receives literal AUX bytes plus checksum");
@@ -217,6 +229,8 @@ int main(int argc, char **argv) {
 	sioDevice->OnSerialReceiveComplete(sio.receiveId, framedRequest.data(), framedRequest.size(), true);
 	sioDevice->OnSerialFence(sio.fenceId);
 	ExpectStatus(sio, {'A', 'A', 'C'}, "W completion emits exact ACK COMPLETE");
+	ExpectEvents(sio, {"begin", "delay", "A", "receive", "fence", "A", "C", "end"},
+		"W completion scheduling order is exact");
 
 	// P derives its exact ready length from the production response, then a
 	// wrong R must leave that response available for the terminal R.
@@ -234,6 +248,7 @@ int main(int argc, char **argv) {
 	Check(sioDevice->OnSerialBeginCommand(Command(0x7f, 'R', responseLength - 1)) == IATDeviceSIO::kCmdResponse_Start,
 		"wrong R reaches adapter");
 	ExpectStatus(sio, {'N'}, "wrong R is rejected without consuming reply");
+	ExpectEvents(sio, {"begin", "delay", "N", "end"}, "wrong R scheduling order is exact");
 	sio.Clear();
 	Check(sioDevice->OnSerialBeginCommand(Command(0x7f, 'P', 0)) == IATDeviceSIO::kCmdResponse_Start, "P after wrong R starts");
 	Check(sio.transmitted.size() == 6 && sio.transmitted[2] == 2, "wrong R retains ready response");
@@ -245,6 +260,7 @@ int main(int argc, char **argv) {
 		sio.transmitted[1] == 'C' && sio.transmitted.back() ==
 		fujinet::io::AtariSioNioFrontend::checksum(sio.transmitted.data() + 2, responseLength),
 		"terminal R keeps response storage through scheduled exact payload");
+	ExpectEvents(sio, {"begin", "delay", "A", "C", "data", "end"}, "terminal R scheduling order is exact");
 
 	// The real data callback passes a malformed checksum to the production
 	// endpoint, which rejects it.  The next W is accepted directly: there is
@@ -256,6 +272,8 @@ int main(int argc, char **argv) {
 	sioDevice->OnSerialReceiveComplete(sio.receiveId, framedRequest.data(), framedRequest.size(), true);
 	sioDevice->OnSerialFence(sio.fenceId);
 	ExpectStatus(sio, {'A', 'N'}, "bad W checksum is rejected by production endpoint");
+	ExpectEvents(sio, {"begin", "delay", "A", "receive", "fence", "N", "end"},
+		"bad W rejection scheduling order is exact");
 	framedRequest.back() ^= 0xff;
 	sio.Clear();
 	Check(sioDevice->OnSerialBeginCommand(Command(0x7f, 'W', request.size())) == IATDeviceSIO::kCmdResponse_Start,
