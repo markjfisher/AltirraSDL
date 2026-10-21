@@ -17,7 +17,7 @@
 #include "fujinet/core/device_init.h"
 #include "fujinet/core/logging.h"
 #include "fujinet/fs/boot_mount.h"
-#include "fujinet/io/core/channel.h"
+#include "fujinet/io/atari_sio_nio_frontend.h"
 #include "fujinet/io/devices/disk_device.h"
 #include "fujinet/io/devices/fuji_device.h"
 #include "fujinet/io/protocol/wire_device_ids.h"
@@ -25,85 +25,17 @@
 #include "fujinet/platform/posix/fs_factory.h"
 
 #include <algorithm>
-#include <chrono>
-#include <condition_variable>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <memory>
-#include <mutex>
-#include <thread>
 #include <vector>
 
 namespace {
 
 static constexpr const char *kTag = "altirra-fn";
-
-class AltirraFujiBusChannel final : public fujinet::io::Channel {
-public:
-	bool available() override {
-		std::lock_guard<std::mutex> lock(mMutex);
-		return !mRx.empty();
-	}
-
-	std::size_t read(std::uint8_t *buffer, std::size_t maxLen) override {
-		std::lock_guard<std::mutex> lock(mMutex);
-		if (!buffer || maxLen == 0 || mRx.empty())
-			return 0;
-
-		const std::size_t n = std::min(maxLen, mRx.size());
-		std::copy_n(mRx.begin(), n, buffer);
-		mRx.erase(mRx.begin(), mRx.begin() + static_cast<std::ptrdiff_t>(n));
-		return n;
-	}
-
-	void write(const std::uint8_t *buffer, std::size_t len) override {
-		std::lock_guard<std::mutex> lock(mMutex);
-		if (!buffer || len == 0)
-			return;
-
-		mTx.insert(mTx.end(), buffer, buffer + len);
-	}
-
-	void PushRequest(const void *data, std::size_t len) {
-		std::lock_guard<std::mutex> lock(mMutex);
-		const auto *bytes = static_cast<const std::uint8_t *>(data);
-		if (bytes && len)
-			mRx.insert(mRx.end(), bytes, bytes + len);
-	}
-
-	std::vector<std::uint8_t> TakeResponse(std::size_t len) {
-		std::lock_guard<std::mutex> lock(mMutex);
-		std::vector<std::uint8_t> out(len);
-		const std::size_t n = std::min(len, mTx.size());
-		if (n) {
-			std::copy_n(mTx.begin(), n, out.begin());
-			mTx.erase(mTx.begin(), mTx.begin() + static_cast<std::ptrdiff_t>(n));
-		}
-		return out;
-	}
-
-	bool HasResponse() const {
-		std::lock_guard<std::mutex> lock(mMutex);
-		return !mTx.empty();
-	}
-
-	bool HasRequest() const {
-		std::lock_guard<std::mutex> lock(mMutex);
-		return !mRx.empty();
-	}
-
-	void ClearPendingWrite() {
-		std::lock_guard<std::mutex> lock(mMutex);
-		mRx.clear();
-	}
-
-private:
-	mutable std::mutex mMutex;
-	std::vector<std::uint8_t> mRx;
-	std::vector<std::uint8_t> mTx;
-};
 
 class ATDeviceFujiNetNIO final : public ATDevice, public ATDeviceSIO {
 public:
@@ -116,6 +48,7 @@ public:
 	void GetSettings(ATPropertySet& settings) override;
 	bool SetSettings(const ATPropertySet& settings) override;
 	void Shutdown() override;
+	void ColdReset() override;
 
 	void InitSIO(IATDeviceSIOManager *siomgr) override;
 	CmdResponse OnSerialBeginCommand(const ATDeviceSIOCommand& cmd) override;
@@ -127,57 +60,25 @@ public:
 private:
 	static constexpr uint32 kReceiveIdWrite = 1;
 	static constexpr uint32 kFenceIdProcessWrite = 2;
-	static constexpr uint32 kFenceIdSendRead = 3;
 	static constexpr std::uint8_t kNioSioDevice = 0x7F;
-	static constexpr std::uint8_t kNetSioNetworkDevice = 0x71;
-	static constexpr std::uint8_t kWriteCommand = 'W';
-	static constexpr std::uint8_t kReadCommand = 'R';
-	static constexpr uint32 kDefaultReadSize = 768;
 	static constexpr uint32 kCommandAckDelayCycles = 1800;
-	static constexpr uint32 kReadRetryDelayCycles = 1800;
-	static constexpr uint32 kReadMaxRetries = 10000;
-
-	static bool IsNioSioDevice(std::uint8_t device) {
-		return device == kNioSioDevice || device == kNetSioNetworkDevice;
-	}
-
-	static uint32 AuxLength(const ATDeviceSIOCommand& cmd) {
-		return static_cast<uint32>(cmd.mAUX[0]) | (static_cast<uint32>(cmd.mAUX[1]) << 8);
-	}
-
-	static uint32 TransferLength(const ATDeviceSIOCommand& cmd, uint32 explicitLength) {
-		if (explicitLength)
-			return explicitLength;
-
-		const uint32 aux = AuxLength(cmd);
-		return aux ? aux : kDefaultReadSize;
-	}
 
 	bool InitCore();
-	void StartWorker();
-	void StopWorker();
-	void WorkerLoop();
-	CmdResponse BeginWriteCommand(const ATDeviceSIOCommand& cmd, uint32 len);
-	CmdResponse BeginReadCommand(const ATDeviceSIOCommand& cmd, uint32 len);
-	CmdResponse BeginCommand(const ATDeviceSIOCommand& cmd, uint32 explicitLength);
+	CmdResponse BeginCommand(const ATDeviceSIOCommand& cmd);
 	void ProcessPendingWrite();
-	void SendReadResponseOrRetry();
+	void SendResult(const fujinet::io::AtariSioNioFrontend::Result& result);
+	void ClearPendingWrite();
 
 	IATDeviceSIOManager *mpSIOMgr = nullptr;
 	vdrefptr<IATDeviceSIOInterface> mpSIOInterface;
 	fujinet::core::FujinetCore mCore;
-	AltirraFujiBusChannel mChannel;
+	std::unique_ptr<fujinet::io::AtariSioNioFrontend> mNio;
 	VDStringW mConfigDir{L"./fujinet-data"};
 	bool mbCoreReady = false;
-	bool mbPendingWrite = false;
-	bool mbPendingWriteChecksumOK = false;
-	uint32 mPendingReadSize = 0;
-	uint32 mPendingReadRetries = 0;
+	std::size_t mExpectedWriteBytes = 0;
 	std::vector<std::uint8_t> mPendingWrite;
-	std::mutex mWorkerMutex;
-	std::condition_variable mWorkerCv;
-	std::thread mWorker;
-	bool mbWorkerStop = false;
+	// Result bytes are retained until Altirra's queued SIO send has drained.
+	std::vector<std::uint8_t> mScheduledReply;
 };
 
 } // namespace
@@ -200,7 +101,7 @@ ATDeviceFujiNetNIO::ATDeviceFujiNetNIO() {
 }
 
 ATDeviceFujiNetNIO::~ATDeviceFujiNetNIO() {
-	StopWorker();
+	Shutdown();
 }
 
 void *ATDeviceFujiNetNIO::AsInterface(uint32 id) {
@@ -235,9 +136,16 @@ bool ATDeviceFujiNetNIO::SetSettings(const ATPropertySet& settings) {
 }
 
 void ATDeviceFujiNetNIO::Shutdown() {
-	StopWorker();
+	ClearPendingWrite();
+	mNio.reset();
 	mpSIOInterface = nullptr;
 	mpSIOMgr = nullptr;
+}
+
+void ATDeviceFujiNetNIO::ColdReset() {
+	ClearPendingWrite();
+	if (mNio)
+		mNio->reset();
 }
 
 void ATDeviceFujiNetNIO::InitSIO(IATDeviceSIOManager *siomgr) {
@@ -245,38 +153,36 @@ void ATDeviceFujiNetNIO::InitSIO(IATDeviceSIOManager *siomgr) {
 	mpSIOInterface = mpSIOMgr->AddDevice(this);
 	if (!mbCoreReady) {
 		mbCoreReady = InitCore();
-		if (mbCoreReady)
-			StartWorker();
 	}
 }
 
 IATDeviceSIO::CmdResponse ATDeviceFujiNetNIO::OnSerialBeginCommand(const ATDeviceSIOCommand& cmd) {
-	return BeginCommand(cmd, 0);
+	return BeginCommand(cmd);
 }
 
 void ATDeviceFujiNetNIO::OnSerialAbortCommand() {
-	mbPendingWrite = false;
-	mbPendingWriteChecksumOK = false;
-	mPendingWrite.clear();
-	mChannel.ClearPendingWrite();
+	ClearPendingWrite();
+	if (mNio)
+		mNio->abort_write();
 }
 
 void ATDeviceFujiNetNIO::OnSerialReceiveComplete(uint32 id, const void *data, uint32 len, bool checksumOK) {
 	if (id != kReceiveIdWrite)
 		return;
 
-	mbPendingWrite = true;
-	mbPendingWriteChecksumOK = checksumOK;
 	mPendingWrite.resize(len);
 	if (data && len)
 		std::memcpy(mPendingWrite.data(), data, len);
+	// The production endpoint verifies the literal data checksum itself.  A
+	// malformed Altirra receive is represented as a mismatching terminal byte
+	// instead of a second adapter-local protocol decision.
+	if (!checksumOK && !mPendingWrite.empty())
+		mPendingWrite.back() ^= 0xff;
 }
 
 void ATDeviceFujiNetNIO::OnSerialFence(uint32 id) {
 	if (id == kFenceIdProcessWrite)
 		ProcessPendingWrite();
-	else if (id == kFenceIdSendRead)
-		SendReadResponseOrRetry();
 }
 
 IATDeviceSIO::CmdResponse ATDeviceFujiNetNIO::OnSerialAccelCommand(const ATDeviceSIORequest& request) {
@@ -314,17 +220,18 @@ bool ATDeviceFujiNetNIO::InitCore() {
 	}
 
 	fujinet::platform::FujiDeviceHooks hooks{
-		.onReset = [] {
+		.onReset = [this] {
 			FN_LOGI(kTag, "FujiNet-NIO reset requested inside AltirraSDL POC");
+			ColdReset();
 		}
 	};
 
 	fujinet::build::BuildProfile profile{
-		fujinet::build::Machine::Atari8Bit,
-		fujinet::build::TransportKind::FujiBusSlip,
-		fujinet::build::ChannelKind::SioGpio,
-		"AltirraSDL embedded FujiNet-NIO",
-		{}
+		.machine = fujinet::build::Machine::Atari8Bit,
+		.primaryTransport = fujinet::build::TransportKind::None,
+		.primaryChannel = fujinet::build::ChannelKind::SioGpio,
+		.name = "AltirraSDL embedded Atari SIO ingress",
+		.hw = {},
 	};
 
 	auto fuji = fujinet::platform::create_fuji_device(mCore, profile, hooks);
@@ -370,145 +277,100 @@ bool ATDeviceFujiNetNIO::InitCore() {
 
 	fujinet::core::register_network_device(mCore, config.translation);
 	fujinet::core::register_modem_device(mCore);
-	fujinet::core::setup_transports(mCore, mChannel, profile, &config);
+	mNio = std::make_unique<fujinet::io::AtariSioNioFrontend>(mCore.routingManager());
 	return true;
 }
 
-void ATDeviceFujiNetNIO::StartWorker() {
-	std::lock_guard<std::mutex> lock(mWorkerMutex);
-	if (mWorker.joinable())
-		return;
+IATDeviceSIO::CmdResponse ATDeviceFujiNetNIO::BeginCommand(const ATDeviceSIOCommand& cmd) {
+	if (!mbCoreReady || !mpSIOInterface || !mNio)
+		return kCmdResponse_NotHandled;
 
-	mbWorkerStop = false;
-	mWorker = std::thread([this] {
-		WorkerLoop();
-	});
-}
+	// This device owns only packet-native Atari NIO.  Disk devices retain
+	// D1:-D8:, and the historic $71 stream endpoint is intentionally absent.
+	if (cmd.mDevice != kNioSioDevice)
+		return kCmdResponse_NotHandled;
 
-void ATDeviceFujiNetNIO::StopWorker() {
-	{
-		std::lock_guard<std::mutex> lock(mWorkerMutex);
-		mbWorkerStop = true;
-	}
-	mWorkerCv.notify_all();
-
-	if (mWorker.joinable())
-		mWorker.join();
-}
-
-void ATDeviceFujiNetNIO::WorkerLoop() {
-	for(;;) {
-		{
-			std::unique_lock<std::mutex> lock(mWorkerMutex);
-			mWorkerCv.wait_for(lock, std::chrono::milliseconds(1), [this] {
-				return mbWorkerStop || mChannel.HasRequest();
-			});
-
-			if (mbWorkerStop)
-				break;
-		}
-
-		mCore.tick();
-	}
-}
-
-IATDeviceSIO::CmdResponse ATDeviceFujiNetNIO::BeginWriteCommand(const ATDeviceSIOCommand& cmd, uint32 len) {
-	(void)cmd;
-
-	if (!len)
-		return kCmdResponse_Fail_NAK;
+	std::array<std::uint8_t, fujinet::io::AtariSioNioFrontend::command_bytes> frame{
+		cmd.mDevice, cmd.mCommand, cmd.mAUX[0], cmd.mAUX[1], 0};
+	frame.back() = fujinet::io::AtariSioNioFrontend::checksum(frame.data(), frame.size() - 1);
+	const auto result = mNio->begin(frame);
 
 	mpSIOInterface->BeginCommand();
 	mpSIOInterface->Delay(kCommandAckDelayCycles);
-	mpSIOInterface->SendACK();
-	mpSIOInterface->ReceiveData(kReceiveIdWrite, len, true);
-	mpSIOInterface->InsertFence(kFenceIdProcessWrite);
-	return kCmdResponse_Start;
-}
-
-IATDeviceSIO::CmdResponse ATDeviceFujiNetNIO::BeginReadCommand(const ATDeviceSIOCommand& cmd, uint32 len) {
-	(void)cmd;
-
-	const uint32 transferSize = len ? len : kDefaultReadSize;
-	mPendingReadSize = transferSize;
-	mPendingReadRetries = 0;
-
-	mpSIOInterface->BeginCommand();
-	mpSIOInterface->Delay(kCommandAckDelayCycles);
-	mpSIOInterface->SendACK();
-	mpSIOInterface->InsertFence(kFenceIdSendRead);
-	return kCmdResponse_Start;
-}
-
-IATDeviceSIO::CmdResponse ATDeviceFujiNetNIO::BeginCommand(const ATDeviceSIOCommand& cmd, uint32 explicitLength) {
-	if (!mbCoreReady || !mpSIOInterface)
-		return kCmdResponse_NotHandled;
-
-	if (!IsNioSioDevice(cmd.mDevice))
-		return kCmdResponse_NotHandled;
-
-	const uint32 len = TransferLength(cmd, explicitLength);
-	switch(cmd.mCommand) {
-		case kWriteCommand:
-			return BeginWriteCommand(cmd, len);
-
-		case kReadCommand:
-			return BeginReadCommand(cmd, len);
-
-		default:
-			return kCmdResponse_Fail_NAK;
+	mScheduledReply = result.bytes;
+	if (!result.accepted || mScheduledReply.empty() || mScheduledReply.front() != 'A') {
+		mpSIOInterface->SendNAK();
+		mpSIOInterface->EndCommand();
+		return kCmdResponse_Start;
 	}
+
+	mpSIOInterface->SendACK();
+	if (result.expected_write_bytes != 0) {
+		mExpectedWriteBytes = result.expected_write_bytes;
+		// Receive the literal data frame, including its checksum.  The endpoint
+		// remains the sole owner of native W validation and state transition.
+		mpSIOInterface->ReceiveData(kReceiveIdWrite,
+			static_cast<uint32>(mExpectedWriteBytes + 1), false);
+		mpSIOInterface->InsertFence(kFenceIdProcessWrite);
+		return kCmdResponse_Start;
+	}
+
+	SendResult(result);
+	return kCmdResponse_Start;
+}
+
+void ATDeviceFujiNetNIO::ClearPendingWrite() {
+	mExpectedWriteBytes = 0;
+	mPendingWrite.clear();
 }
 
 void ATDeviceFujiNetNIO::ProcessPendingWrite() {
-	if (!mbPendingWrite) {
-		mpSIOInterface->SendError();
+	if (!mNio || mPendingWrite.size() != mExpectedWriteBytes + 1) {
+		mpSIOInterface->SendNAK();
 		mpSIOInterface->EndCommand();
+		ClearPendingWrite();
 		return;
 	}
 
-	if (!mbPendingWriteChecksumOK) {
-		FN_LOGW(kTag, "write checksum failed");
-		mbPendingWrite = false;
-		mbPendingWriteChecksumOK = false;
-		mPendingWrite.clear();
-		mpSIOInterface->SendError();
+	const auto result = mNio->complete_write(mPendingWrite.data(), mPendingWrite.size());
+	ClearPendingWrite();
+	mScheduledReply = result.bytes;
+	if (!result.accepted || mScheduledReply.empty() || mScheduledReply.front() != 'A') {
+		mpSIOInterface->SendNAK();
 		mpSIOInterface->EndCommand();
 		return;
 	}
-
-	mChannel.PushRequest(mPendingWrite.data(), mPendingWrite.size());
-	mWorkerCv.notify_one();
-
-	mbPendingWrite = false;
-	mbPendingWriteChecksumOK = false;
-	mPendingWrite.clear();
-
-	mpSIOInterface->SendComplete();
-	mpSIOInterface->EndCommand();
+	mpSIOInterface->SendACK();
+	SendResult(result);
 }
 
-void ATDeviceFujiNetNIO::SendReadResponseOrRetry() {
-	if (mChannel.HasResponse()) {
-		auto response = mChannel.TakeResponse(mPendingReadSize);
+void ATDeviceFujiNetNIO::SendResult(const fujinet::io::AtariSioNioFrontend::Result& result) {
+	(void)result;
+	// ACK was emitted before this method.  The remaining frontend bytes must
+	// be C + payload + checksum; use Altirra's scheduler for timing and wire
+	// transmission while retaining mScheduledReply until its queue drains.
+	if (mScheduledReply.size() < 2 || mScheduledReply[0] != 'A' || mScheduledReply[1] != 'C') {
+		mpSIOInterface->SendNAK();
+		mpSIOInterface->EndCommand();
+		return;
+	}
+	if (mScheduledReply.size() == 2) {
 		mpSIOInterface->SendComplete();
-		mpSIOInterface->SendData(response.data(), mPendingReadSize, true);
 		mpSIOInterface->EndCommand();
-		mPendingReadSize = 0;
-		mPendingReadRetries = 0;
 		return;
 	}
 
-	if (++mPendingReadRetries > kReadMaxRetries) {
-		FN_LOGW(kTag, "timed out waiting for FujiBus response");
-		mpSIOInterface->SendError();
+	const auto payload_bytes = mScheduledReply.size() - 3;
+	const auto checksum = fujinet::io::AtariSioNioFrontend::checksum(
+		mScheduledReply.data() + 2, payload_bytes);
+	if (checksum != mScheduledReply.back()) {
+		mpSIOInterface->SendNAK();
 		mpSIOInterface->EndCommand();
-		mPendingReadSize = 0;
-		mPendingReadRetries = 0;
 		return;
 	}
 
-	mWorkerCv.notify_one();
-	mpSIOInterface->Delay(kReadRetryDelayCycles);
-	mpSIOInterface->InsertFence(kFenceIdSendRead);
+	mpSIOInterface->SendComplete();
+	if (payload_bytes)
+		mpSIOInterface->SendData(mScheduledReply.data() + 2, static_cast<uint32>(payload_bytes), true);
+	mpSIOInterface->EndCommand();
 }
