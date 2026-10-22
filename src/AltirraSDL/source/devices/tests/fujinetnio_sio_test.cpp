@@ -229,7 +229,7 @@ int main(int argc, char **argv) {
 	sioDevice->OnSerialReceiveComplete(sio.receiveId, framedRequest.data(), framedRequest.size(), true);
 	sioDevice->OnSerialFence(sio.fenceId);
 	ExpectStatus(sio, {'A', 'A', 'C'}, "W completion emits exact ACK COMPLETE");
-	ExpectEvents(sio, {"begin", "delay", "A", "receive", "fence", "A", "C", "end"},
+	ExpectEvents(sio, {"begin", "delay", "A", "receive", "fence", "delay", "A", "C", "end"},
 		"W completion scheduling order is exact");
 
 	// P derives its exact ready length from the production response, then a
