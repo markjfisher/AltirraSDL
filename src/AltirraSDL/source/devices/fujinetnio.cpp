@@ -20,6 +20,7 @@
 #include "fujinet/io/atari_sio_nio_frontend.h"
 #include "fujinet/io/devices/disk_device.h"
 #include "fujinet/io/devices/fuji_device.h"
+#include "fujinet/io/devices/virtual_device.h"
 #include "fujinet/io/protocol/wire_device_ids.h"
 #include "fujinet/platform/fuji_device_factory.h"
 #include "fujinet/platform/posix/fs_factory.h"
@@ -28,6 +29,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <memory>
@@ -36,6 +38,35 @@
 namespace {
 
 static constexpr const char *kTag = "altirra-fn";
+
+// The virtual projection needs one deterministic packet response, but it must
+// still traverse the embedded FujinetCore routing manager.  This route is
+// opt-in through the test-only projectionfixture setting; it is not an SIO
+// peer and it does not participate in normal embedded-device operation.
+class CoreDispatchProjectionFixture final : public fujinet::io::VirtualDevice {
+public:
+	explicit CoreDispatchProjectionFixture(std::uint32_t& dispatches)
+		: mDispatches(dispatches) {}
+
+	fujinet::io::IOResponse handle(const fujinet::io::IORequest& request) override {
+		const bool expected = request.deviceId == 1 && request.command == 2 &&
+			request.params.empty() && request.payload.empty();
+		if (!expected)
+			return fujinet::io::make_base_response(
+				request, fujinet::io::StatusCode::InvalidRequest);
+
+		++mDispatches;
+		std::fprintf(stderr,
+			"[fujinetnio-projection] core dispatch fixture route invocation %u\n",
+			mDispatches);
+		auto response = fujinet::io::make_success_response(request);
+		response.payload = {0xaa, 0x55};
+		return response;
+	}
+
+private:
+	std::uint32_t& mDispatches;
+};
 
 class ATDeviceFujiNetNIO final : public ATDevice, public ATDeviceSIO {
 public:
@@ -74,6 +105,8 @@ private:
 	fujinet::core::FujinetCore mCore;
 	std::unique_ptr<fujinet::io::AtariSioNioFrontend> mNio;
 	VDStringW mConfigDir{L"./fujinet-data"};
+	bool mProjectionFixture = false;
+	std::uint32_t mProjectionDispatches = 0;
 	bool mbCoreReady = false;
 	std::size_t mExpectedWriteBytes = 0;
 	std::vector<std::uint8_t> mPendingWrite;
@@ -124,14 +157,19 @@ void ATDeviceFujiNetNIO::GetSettingsBlurb(VDStringW& buf) {
 
 void ATDeviceFujiNetNIO::GetSettings(ATPropertySet& settings) {
 	settings.SetString("configdir", mConfigDir.c_str());
+	if (mProjectionFixture)
+		settings.SetBool("projectionfixture", true);
 }
 
 bool ATDeviceFujiNetNIO::SetSettings(const ATPropertySet& settings) {
 	const VDStringW newConfigDir(settings.GetString("configdir", L"./fujinet-data"));
-	if (mbCoreReady && newConfigDir != mConfigDir) {
-		FN_LOGW(kTag, "configdir changes take effect after removing and re-adding the device");
+	const bool newProjectionFixture = settings.GetBool("projectionfixture", false);
+	if (mbCoreReady &&
+		(newConfigDir != mConfigDir || newProjectionFixture != mProjectionFixture)) {
+		FN_LOGW(kTag, "embedded FujiNet-NIO settings changes take effect after removing and re-adding the device");
 	}
 	mConfigDir = newConfigDir;
+	mProjectionFixture = newProjectionFixture;
 	return true;
 }
 
@@ -277,6 +315,11 @@ bool ATDeviceFujiNetNIO::InitCore() {
 
 	fujinet::core::register_network_device(mCore, config.translation);
 	fujinet::core::register_modem_device(mCore);
+	if (mProjectionFixture && !mCore.deviceManager().registerDevice(
+		1, std::make_unique<CoreDispatchProjectionFixture>(mProjectionDispatches))) {
+		FN_LOGE(kTag, "failed to register embedded core-dispatch projection route");
+		return false;
+	}
 	mNio = std::make_unique<fujinet::io::AtariSioNioFrontend>(mCore.routingManager());
 	return true;
 }
@@ -340,6 +383,11 @@ void ATDeviceFujiNetNIO::ProcessPendingWrite() {
 		mpSIOInterface->EndCommand();
 		return;
 	}
+	// The frontend's first ACK accepted W's command frame.  The physical data
+	// phase still needs its own ACK before COMPLETE.  Altirra's custom-device
+	// implementation enforces this 850us post-data guard as 1530 scheduler
+	// cycles; without it SIOV can receive a garbled synchronous ACK.
+	mpSIOInterface->Delay(1530);
 	mpSIOInterface->SendACK();
 	SendResult(result);
 }
