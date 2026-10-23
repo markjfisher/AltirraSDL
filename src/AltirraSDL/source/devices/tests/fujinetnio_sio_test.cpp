@@ -383,6 +383,51 @@ int main(int argc, char **argv) {
 		"correct retained R sends the original complete File response");
 	malformedDevice->Shutdown();
 	malformedDevice->Release();
+
+	// A separate public device uses the proven post-acceptance terminal-R
+	// delivery fault. The frontend must consume the original response before
+	// Altirra sees its corrupt checksum; subsequent R and P prove IDLE.
+	ATPropertySet interruptedSettings;
+	interruptedSettings.SetString("configdir", VDTextAToW(config.c_str()).c_str());
+	interruptedSettings.SetBool("publicacceptancefixture", true);
+	interruptedSettings.SetBool("publicacceptanceinterruptterminalr", true);
+	IATDevice *interruptedDevice = nullptr;
+	ATCreateDeviceFujiNetNIO(interruptedSettings, &interruptedDevice);
+	Check(interruptedDevice != nullptr, "interrupted-R device factory returned embedded device");
+	auto *interruptedSioDevice = static_cast<IATDeviceSIO *>(
+		interruptedDevice->AsInterface(IATDeviceSIO::kTypeID));
+	Check(interruptedSioDevice != nullptr, "interrupted-R device exposes IATDeviceSIO");
+	FakeSIOManager interruptedManager;
+	interruptedSioDevice->InitSIO(&interruptedManager);
+	FakeSIO& interruptedSio = *interruptedManager.mSIO;
+	Check(interruptedSioDevice->OnSerialBeginCommand(Command(0x7f, 'W', fileRequest.size())) ==
+		IATDeviceSIO::kCmdResponse_Start, "public File W for interrupted R starts");
+	interruptedSioDevice->OnSerialReceiveComplete(interruptedSio.receiveId,
+		framedFileRequest.data(), framedFileRequest.size(), true);
+	interruptedSioDevice->OnSerialFence(interruptedSio.fenceId);
+	ExpectStatus(interruptedSio, {'A', 'A', 'C'}, "public File W prepares interrupted terminal response");
+	interruptedSio.Clear();
+	Check(interruptedSioDevice->OnSerialBeginCommand(Command(0x7f, 'P', 0)) ==
+		IATDeviceSIO::kCmdResponse_Start, "interrupted-R READY P starts");
+	ExpectStatus(interruptedSio, {'A', 'C', 2, 17, 0, 19}, "interrupted-R READY length is original");
+	interruptedSio.Clear();
+	Check(interruptedSioDevice->OnSerialBeginCommand(Command(0x7f, 'R', 17)) ==
+		IATDeviceSIO::kCmdResponse_Start, "accepted interrupted terminal R starts");
+	Check(interruptedSio.transmitted.size() == 20 && interruptedSio.transmitted[0] == 'A' &&
+		interruptedSio.transmitted[1] == 'C' && interruptedSio.transmitted.back() ==
+		(static_cast<std::uint8_t>(fujinet::io::AtariSioNioFrontend::checksum(
+			interruptedSio.transmitted.data() + 2, 17) ^ 0x01)),
+		"accepted terminal R delivers only its corrupt downstream checksum");
+	interruptedSio.Clear();
+	Check(interruptedSioDevice->OnSerialBeginCommand(Command(0x7f, 'R', 17)) ==
+		IATDeviceSIO::kCmdResponse_Start, "consumed terminal R retry reaches adapter");
+	ExpectStatus(interruptedSio, {'N'}, "consumed terminal R retry is NAKed");
+	interruptedSio.Clear();
+	Check(interruptedSioDevice->OnSerialBeginCommand(Command(0x7f, 'P', 0)) ==
+		IATDeviceSIO::kCmdResponse_Start, "P after consumed R starts");
+	ExpectStatus(interruptedSio, {'A', 'C', 0, 0, 0, 0}, "consumed terminal R leaves canonical IDLE");
+	interruptedDevice->Shutdown();
+	interruptedDevice->Release();
 	std::filesystem::remove_all(temp);
 	std::puts("Altirra embedded FujiNet-NIO SIO adapter test passed");
 	return 0;
