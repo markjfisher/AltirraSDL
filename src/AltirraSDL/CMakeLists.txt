@@ -665,8 +665,15 @@ if(ALTIRRA_FUJINET_NIO)
 
         target_sources(AltirraSDL PRIVATE
             source/devices/fujinetnio.cpp
+            # The opt-in public-API acceptance fixture freezes ClockDevice
+            # without changing the host clock. Normal embedded operation
+            # leaves this test clock unset and observes the real POSIX time.
+            ${ALTIRRA_FUJINET_NIO_SOURCE_DIR}/src/platform/posix/time.cpp
         )
-        target_compile_definitions(AltirraSDL PRIVATE ALTIRRA_FUJINET_NIO=1)
+        target_compile_definitions(AltirraSDL PRIVATE
+            ALTIRRA_FUJINET_NIO=1
+            ALTIRRA_FUJINET_NIO_TEST_CLOCK=1
+            FN_POSIX_TEST_CLOCK=1)
         target_link_libraries(AltirraSDL PRIVATE fujinet-nio)
     else()
         message(WARNING "ALTIRRA_FUJINET_NIO is ON but ALTIRRA_FUJINET_NIO_SOURCE_DIR does not contain fujinet-nio; embedded device disabled.")

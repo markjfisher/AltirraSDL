@@ -20,8 +20,12 @@
 #include "fujinet/io/atari_sio_nio_frontend.h"
 #include "fujinet/io/devices/disk_device.h"
 #include "fujinet/io/devices/fuji_device.h"
+#include "fujinet/io/devices/network_protocol.h"
+#include "fujinet/io/devices/network_protocol_registry.h"
+#include "fujinet/io/core/request_handler.h"
 #include "fujinet/io/devices/virtual_device.h"
 #include "fujinet/io/protocol/wire_device_ids.h"
+#include "fujinet/disk/disk_types.h"
 #include "fujinet/platform/fuji_device_factory.h"
 #include "fujinet/platform/posix/fs_factory.h"
 
@@ -33,11 +37,27 @@
 #include <cstring>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <vector>
+
+#if defined(ALTIRRA_FUJINET_NIO_TEST_CLOCK)
+namespace fujinet::platform {
+void set_test_unix_time_seconds(std::optional<std::uint64_t> frozen);
+}
+#endif
 
 namespace {
 
 static constexpr const char *kTag = "altirra-fn";
+static constexpr const char *kAcceptanceTag = "atari-public-acceptance";
+static constexpr std::uint64_t kAcceptanceClockUnixSeconds = 0x0102030405060708ULL;
+static constexpr const char *kAcceptanceNetworkUri = "fixture://nio-accept";
+static constexpr const char *kAcceptanceNetworkWrite = "NET-WRITE-24";
+static constexpr const char *kAcceptanceNetworkReply = "NET-REPLY-24";
+static constexpr const char *kAcceptanceDiskPath = "/fnaccept-disk.atr";
+static constexpr std::size_t kAcceptanceDiskSlot = 1; // Guest slot 2.
+static constexpr std::uint16_t kAcceptanceDiskSectorBytes = 128;
+static constexpr std::uint32_t kAcceptanceDiskSectors = 16;
 
 std::uint8_t CapacityPattern(std::size_t packetOffset) {
 	return static_cast<std::uint8_t>(packetOffset ^ (packetOffset >> 8U) ^ 0xa5U);
@@ -108,6 +128,106 @@ private:
 	std::uint32_t& mDispatches;
 };
 
+// This opt-in fixture composes the ordinary production service devices for
+// the public cc65 acceptance guest.  It does not handle SIO or FujiBus: the
+// embedded AtariSioNioFrontend still owns every Q/W/P/R transaction and the
+// normal RoutingManager still owns the real device dispatch.
+struct PublicAcceptanceNetworkState {
+	std::uint32_t opens{};
+	std::uint32_t writes{};
+	std::uint32_t closes{};
+	std::vector<std::uint8_t> lastWrite;
+};
+
+class PublicAcceptanceNetworkProtocol final : public fujinet::io::INetworkProtocol {
+public:
+	explicit PublicAcceptanceNetworkProtocol(std::shared_ptr<PublicAcceptanceNetworkState> state)
+		: mState(std::move(state)) {}
+
+	fujinet::io::StatusCode open(const fujinet::io::NetworkOpenRequest& request) override {
+		++mState->opens;
+		FN_LOGI(kAcceptanceTag, "Network fixture open count=%u method=%u url=%s",
+			mState->opens, static_cast<unsigned>(request.method), request.url.c_str());
+		return request.method == 2 && request.url == kAcceptanceNetworkUri
+			? fujinet::io::StatusCode::Ok : fujinet::io::StatusCode::InvalidRequest;
+	}
+
+	fujinet::io::StatusCode write_body(std::uint32_t offset,
+		const std::uint8_t* data, std::size_t length, std::uint16_t& written) override {
+		++mState->writes;
+		mState->lastWrite.assign(data, data + length);
+		const bool valid = offset == 0 && length == std::strlen(kAcceptanceNetworkWrite) &&
+			std::equal(mState->lastWrite.begin(), mState->lastWrite.end(),
+				kAcceptanceNetworkWrite);
+		FN_LOGI(kAcceptanceTag, "Network fixture write count=%u bytes=%u valid=%u",
+			mState->writes, static_cast<unsigned>(length), valid ? 1u : 0u);
+		written = valid ? static_cast<std::uint16_t>(length) : 0;
+		return valid ? fujinet::io::StatusCode::Ok : fujinet::io::StatusCode::InvalidRequest;
+	}
+
+	fujinet::io::StatusCode read_body(std::uint32_t offset, std::uint8_t* out,
+		std::size_t capacity, std::uint16_t& read, bool& eof, bool& moreAvailable) override {
+		const std::size_t replyLength = std::strlen(kAcceptanceNetworkReply);
+		if (offset > replyLength)
+			return fujinet::io::StatusCode::InvalidRequest;
+		const std::size_t available = replyLength - static_cast<std::size_t>(offset);
+		const std::size_t count = std::min(available, capacity);
+		std::copy_n(reinterpret_cast<const std::uint8_t*>(kAcceptanceNetworkReply) + offset,
+			count, out);
+		read = static_cast<std::uint16_t>(count);
+		eof = count == available;
+		moreAvailable = !eof;
+		return fujinet::io::StatusCode::Ok;
+	}
+
+	fujinet::io::StatusCode info(fujinet::io::NetworkInfo& out) override {
+		out = fujinet::io::NetworkInfo{};
+		return fujinet::io::StatusCode::Ok;
+	}
+
+	void poll() override {}
+
+	void close() override {
+		++mState->closes;
+		FN_LOGI(kAcceptanceTag, "Network fixture close count=%u", mState->closes);
+	}
+
+private:
+	std::shared_ptr<PublicAcceptanceNetworkState> mState;
+};
+
+class PublicAcceptanceRoute final : public fujinet::io::IRequestHandler {
+public:
+	explicit PublicAcceptanceRoute(fujinet::io::IRequestHandler& target)
+		: mTarget(target) {}
+
+	fujinet::io::IOResponse handleRequest(const fujinet::io::IORequest& request) override {
+		using fujinet::io::protocol::WireDeviceId;
+		using fujinet::io::protocol::to_device_id;
+		if (request.deviceId == to_device_id(WireDeviceId::Clock)) {
+			FN_LOGI(kAcceptanceTag, "ClockDevice routed request %u command=%u",
+				++mClockDispatches, static_cast<unsigned>(request.command));
+		} else if (request.deviceId == to_device_id(WireDeviceId::FileService)) {
+			FN_LOGI(kAcceptanceTag, "FileDevice routed request %u command=%u",
+				++mFileDispatches, static_cast<unsigned>(request.command));
+		} else if (request.deviceId == to_device_id(WireDeviceId::NetworkService)) {
+			FN_LOGI(kAcceptanceTag, "NetworkDevice routed request %u command=%u",
+				++mNetworkDispatches, static_cast<unsigned>(request.command));
+		} else if (request.deviceId == to_device_id(WireDeviceId::DiskService)) {
+			FN_LOGI(kAcceptanceTag, "DiskDevice routed request %u command=%u",
+				++mDiskDispatches, static_cast<unsigned>(request.command));
+		}
+		return mTarget.handleRequest(request);
+	}
+
+private:
+	fujinet::io::IRequestHandler& mTarget;
+	std::uint32_t mClockDispatches{};
+	std::uint32_t mFileDispatches{};
+	std::uint32_t mNetworkDispatches{};
+	std::uint32_t mDiskDispatches{};
+};
+
 class ATDeviceFujiNetNIO final : public ATDevice, public ATDeviceSIO {
 public:
 	ATDeviceFujiNetNIO();
@@ -135,6 +255,7 @@ private:
 	static constexpr uint32 kCommandAckDelayCycles = 1800;
 
 	bool InitCore();
+	bool EnablePublicAcceptanceFixture(fujinet::io::DiskDevice& disk);
 	CmdResponse BeginCommand(const ATDeviceSIOCommand& cmd);
 	void ProcessPendingWrite();
 	void SendResult(const fujinet::io::AtariSioNioFrontend::Result& result);
@@ -143,9 +264,11 @@ private:
 	IATDeviceSIOManager *mpSIOMgr = nullptr;
 	vdrefptr<IATDeviceSIOInterface> mpSIOInterface;
 	fujinet::core::FujinetCore mCore;
+	std::unique_ptr<PublicAcceptanceRoute> mPublicAcceptanceRoute;
 	std::unique_ptr<fujinet::io::AtariSioNioFrontend> mNio;
 	VDStringW mConfigDir{L"./fujinet-data"};
 	bool mProjectionFixture = false;
+	bool mPublicAcceptanceFixture = false;
 	// Test-only Altirra scheduling fault. It is deliberately downstream of
 	// AtariSioNioFrontend: the endpoint accepts and consumes terminal R before
 	// a corrupted serial checksum reaches the guest.
@@ -206,6 +329,8 @@ void ATDeviceFujiNetNIO::GetSettings(ATPropertySet& settings) {
 	settings.SetString("configdir", mConfigDir.c_str());
 	if (mProjectionFixture)
 		settings.SetBool("projectionfixture", true);
+	if (mPublicAcceptanceFixture)
+		settings.SetBool("publicacceptancefixture", true);
 	if (mProjectionInterruptTerminalR)
 		settings.SetBool("projectioninterruptterminalr", true);
 }
@@ -213,18 +338,25 @@ void ATDeviceFujiNetNIO::GetSettings(ATPropertySet& settings) {
 bool ATDeviceFujiNetNIO::SetSettings(const ATPropertySet& settings) {
 	const VDStringW newConfigDir(settings.GetString("configdir", L"./fujinet-data"));
 	const bool newProjectionFixture = settings.GetBool("projectionfixture", false);
+	const bool newPublicAcceptanceFixture = settings.GetBool("publicacceptancefixture", false);
 	const bool newProjectionInterruptTerminalR = settings.GetBool("projectioninterruptterminalr", false);
 	if (newProjectionInterruptTerminalR && !newProjectionFixture) {
 		FN_LOGE(kTag, "projectioninterruptterminalr requires projectionfixture=true");
 		return false;
 	}
+	if (newProjectionFixture && newPublicAcceptanceFixture) {
+		FN_LOGE(kTag, "projectionfixture and publicacceptancefixture are mutually exclusive");
+		return false;
+	}
 	if (mbCoreReady &&
 		(newConfigDir != mConfigDir || newProjectionFixture != mProjectionFixture ||
+		 newPublicAcceptanceFixture != mPublicAcceptanceFixture ||
 		 newProjectionInterruptTerminalR != mProjectionInterruptTerminalR)) {
 		FN_LOGW(kTag, "embedded FujiNet-NIO settings changes take effect after removing and re-adding the device");
 	}
 	mConfigDir = newConfigDir;
 	mProjectionFixture = newProjectionFixture;
+	mPublicAcceptanceFixture = newPublicAcceptanceFixture;
 	mProjectionInterruptTerminalR = newProjectionInterruptTerminalR;
 	mProjectionTerminalRFaultInjected = false;
 	return true;
@@ -233,6 +365,11 @@ bool ATDeviceFujiNetNIO::SetSettings(const ATPropertySet& settings) {
 void ATDeviceFujiNetNIO::Shutdown() {
 	ClearPendingWrite();
 	mNio.reset();
+	mPublicAcceptanceRoute.reset();
+#if defined(ALTIRRA_FUJINET_NIO_TEST_CLOCK)
+	if (mPublicAcceptanceFixture)
+		fujinet::platform::set_test_unix_time_seconds(std::nullopt);
+#endif
 	mpSIOInterface = nullptr;
 	mpSIOMgr = nullptr;
 }
@@ -347,6 +484,15 @@ bool ATDeviceFujiNetNIO::InitCore() {
 	fujiConcrete->start();
 	const auto& config = fujiConcrete->config();
 
+	if (mPublicAcceptanceFixture) {
+#if defined(ALTIRRA_FUJINET_NIO_TEST_CLOCK)
+		fujinet::platform::set_test_unix_time_seconds(kAcceptanceClockUnixSeconds);
+#else
+		FN_LOGE(kTag, "publicacceptancefixture requires the embedded test clock");
+		return false;
+#endif
+	}
+
 	fujinet::core::register_file_device(mCore);
 	fujinet::core::register_clock_device(mCore, fujiConcrete->config_store());
 	fujinet::core::register_disk_device(mCore);
@@ -370,16 +516,65 @@ bool ATDeviceFujiNetNIO::InitCore() {
 				activeBootDiskUnit);
 		FN_LOGI(kTag, "restored %zu runtime mount(s), applied %zu boot mount",
 			restoredRuntimeSlots.size(), bootApplied);
+		if (mPublicAcceptanceFixture && !EnablePublicAcceptanceFixture(*diskDev))
+			return false;
+	} else if (mPublicAcceptanceFixture) {
+		FN_LOGE(kTag, "publicacceptancefixture requires DiskDevice");
+		return false;
 	}
 
-	fujinet::core::register_network_device(mCore, config.translation);
+	if (mPublicAcceptanceFixture) {
+		auto networkState = std::make_shared<PublicAcceptanceNetworkState>();
+		fujinet::io::ProtocolRegistry registry;
+		if (!registry.register_scheme("fixture", [networkState] {
+				return std::make_unique<PublicAcceptanceNetworkProtocol>(networkState);
+			})) {
+			FN_LOGE(kTag, "failed to register public acceptance Network fixture");
+			return false;
+		}
+		fujinet::core::register_network_device(mCore, std::move(registry), {});
+	} else {
+		fujinet::core::register_network_device(mCore, config.translation);
+	}
 	fujinet::core::register_modem_device(mCore);
 	if (mProjectionFixture && !mCore.deviceManager().registerDevice(
 		1, std::make_unique<CoreDispatchProjectionFixture>(mProjectionDispatches))) {
 		FN_LOGE(kTag, "failed to register embedded core-dispatch projection route");
 		return false;
 	}
-	mNio = std::make_unique<fujinet::io::AtariSioNioFrontend>(mCore.routingManager());
+	if (mPublicAcceptanceFixture) {
+		mPublicAcceptanceRoute = std::make_unique<PublicAcceptanceRoute>(mCore.routingManager());
+		mNio = std::make_unique<fujinet::io::AtariSioNioFrontend>(*mPublicAcceptanceRoute);
+		FN_LOGI(kAcceptanceTag,
+			"embedded public API Clock/File/Network/Disk acceptance initialized time=0807060504030201");
+	} else {
+		mNio = std::make_unique<fujinet::io::AtariSioNioFrontend>(mCore.routingManager());
+	}
+	return true;
+}
+
+bool ATDeviceFujiNetNIO::EnablePublicAcceptanceFixture(fujinet::io::DiskDevice& disk) {
+	const auto created = disk.disk_service().create_image(
+		"host", kAcceptanceDiskPath, fujinet::disk::ImageType::Atr,
+		kAcceptanceDiskSectorBytes, kAcceptanceDiskSectors, true);
+	if (!created.ok()) {
+		FN_LOGE(kTag, "failed to create public acceptance ATR error=%u",
+			static_cast<unsigned>(created.error));
+		return false;
+	}
+	fujinet::disk::MountOptions options{};
+	options.readOnlyRequested = false;
+	const auto mounted = disk.disk_service().mount(
+		kAcceptanceDiskSlot, "host", kAcceptanceDiskPath, options);
+	if (!mounted.ok()) {
+		FN_LOGE(kTag, "failed to mount public acceptance ATR error=%u",
+			static_cast<unsigned>(mounted.error));
+		return false;
+	}
+	FN_LOGI(kAcceptanceTag, "Disk fixture mounted slot=%u path=%s sector_bytes=%u sectors=%u",
+		static_cast<unsigned>(kAcceptanceDiskSlot + 1), kAcceptanceDiskPath,
+		static_cast<unsigned>(kAcceptanceDiskSectorBytes),
+		static_cast<unsigned>(kAcceptanceDiskSectors));
 	return true;
 }
 

@@ -184,6 +184,10 @@ int main(int argc, char **argv) {
 	ATPropertySet settings;
 	const auto config = temp.string();
 	settings.SetString("configdir", VDTextAToW(config.c_str()).c_str());
+	// Exercise the same opt-in real-service composition used by the public
+	// cc65 acceptance guest. This still reaches the production endpoint via
+	// the IATDeviceSIO callbacks below; it is not a protocol substitute.
+	settings.SetBool("publicacceptancefixture", true);
 
 	IATDevice *device = nullptr;
 	ATCreateDeviceFujiNetNIO(settings, &device);
