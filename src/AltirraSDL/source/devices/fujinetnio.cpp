@@ -39,6 +39,19 @@ namespace {
 
 static constexpr const char *kTag = "altirra-fn";
 
+std::uint8_t CapacityPattern(std::size_t packetOffset) {
+	return static_cast<std::uint8_t>(packetOffset ^ (packetOffset >> 8U) ^ 0xa5U);
+}
+
+bool IsCapacityPayload(const std::vector<std::uint8_t>& payload,
+	std::size_t packetOffset) {
+	for (std::size_t index = 0; index < payload.size(); ++index) {
+		if (payload[index] != CapacityPattern(packetOffset + index))
+			return false;
+	}
+	return true;
+}
+
 // The virtual projection needs one deterministic packet response, but it must
 // still traverse the embedded FujinetCore routing manager.  This route is
 // opt-in through the test-only projectionfixture setting; it is not an SIO
@@ -49,10 +62,18 @@ public:
 		: mDispatches(dispatches) {}
 
 	fujinet::io::IOResponse handle(const fujinet::io::IORequest& request) override {
-		const bool expected = request.deviceId == 1 &&
-			(request.command == 2 || request.command == 3 || request.command == 4) &&
+		const bool smallRequest = request.deviceId == 1 &&
+			request.command >= 2 && request.command <= 4 &&
 			request.params.empty() && request.payload.empty();
-		if (!expected)
+		const bool request511 = request.deviceId == 1 && request.command == 5 &&
+			request.params.empty() && request.payload.size() == 505 &&
+			IsCapacityPayload(request.payload, 6);
+		const bool request512 = request.deviceId == 1 && request.command == 6 &&
+			request.params.empty() && request.payload.size() == 506 &&
+			IsCapacityPayload(request.payload, 6);
+		const bool oversizeResponseRequest = request.deviceId == 1 &&
+			request.command == 7 && request.params.empty() && request.payload.empty();
+		if (!(smallRequest || request511 || request512 || oversizeResponseRequest))
 			return fujinet::io::make_base_response(
 				request, fujinet::io::StatusCode::InvalidRequest);
 
@@ -61,13 +82,25 @@ public:
 			"[fujinetnio-projection] core dispatch fixture route invocation %u\n",
 			mDispatches);
 		auto response = fujinet::io::make_success_response(request);
-		// The reset projection's W2 is intentionally distinct from W1.  Keep
-		// that distinction in the deterministic downstream route so it cannot
-		// pass by replaying the discarded first request.
-		response.payload = request.command == 2 ?
-			std::vector<std::uint8_t>{0xaa, 0x55} :
-			request.command == 3 ? std::vector<std::uint8_t>{0x33, 0xcc} :
-			std::vector<std::uint8_t>{0x5a, 0xa5};
+		// The reset and interrupted-R projections use distinct small responses;
+		// capacity command 6 emits one full, non-repeating 512-byte raw packet.
+		if (request.command == 2) {
+			response.payload = {0xaa, 0x55};
+		} else if (request.command == 3) {
+			response.payload = {0x33, 0xcc};
+		} else if (request.command == 4) {
+			response.payload = {0x5a, 0xa5};
+		} else if (request.command == 6) {
+			response.payload.resize(505);
+			for (std::size_t index = 0; index < response.payload.size(); ++index)
+				response.payload[index] = CapacityPattern(7 + index);
+		} else if (request.command == 7) {
+			// This serializes to 513 raw FujiBus bytes. The production frontend
+			// must replace it with its bounded InternalError response.
+			response.payload.resize(506);
+			for (std::size_t index = 0; index < response.payload.size(); ++index)
+				response.payload[index] = CapacityPattern(7 + index);
+		}
 		return response;
 	}
 
