@@ -76,6 +76,7 @@ std::string CmdDeviceList(ATSimulator& sim, const std::vector<std::string>& toke
 std::string CmdDeviceGet(ATSimulator& sim, const std::vector<std::string>& tokens);
 std::string CmdDeviceAdd(ATSimulator& sim, const std::vector<std::string>& tokens);
 std::string CmdDeviceSet(ATSimulator& sim, const std::vector<std::string>& tokens);
+std::string CmdDeviceColdReset(ATSimulator& sim, const std::vector<std::string>& tokens);
 std::string CmdDeviceRemove(ATSimulator& sim, const std::vector<std::string>& tokens);
 std::string CmdDeviceClear(ATSimulator& sim, const std::vector<std::string>& tokens);
 

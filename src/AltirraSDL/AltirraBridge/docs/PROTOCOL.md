@@ -1013,6 +1013,13 @@ response has `"ok":false` and includes the device payload and its
 reconfiguration can recover it without first removing it. Runtime diagnostics
 do not fail `DEVICE_SET`; inspect `healthy` and `diagnostics` to detect them.
 
+#### `DEVICE_COLD_RESET tag-or-path`
+
+Call `ColdReset()` on one installed device without resetting the Atari
+computer. The response includes the resolved device payload, `"reset":true`,
+and `"lifecycle":"cold"`. This is a peripheral lifecycle operation, so the
+guest CPU remains running.
+
 #### `DEVICE_REMOVE tag-or-path` / `DEVICE_CLEAR`
 
 Remove one non-internal device, or all non-internal devices. Both

@@ -2657,6 +2657,26 @@ std::string CmdDeviceSet(ATSimulator& sim, const std::vector<std::string>& token
 	return SetDeviceEnabled(sim, tokens[1], enable, tokens, 3, true);
 }
 
+std::string CmdDeviceColdReset(ATSimulator& sim, const std::vector<std::string>& tokens) {
+	if (tokens.size() != 2)
+		return JsonError("DEVICE_COLD_RESET: usage: DEVICE_COLD_RESET <tag-or-path>");
+
+	ATDeviceManager *dm = sim.GetDeviceManager();
+	if (!dm)
+		return JsonError("DEVICE_COLD_RESET: device manager unavailable");
+
+	IATDevice *dev = ResolveDeviceReference(*dm, tokens[1]);
+	if (!dev)
+		return JsonError("DEVICE_COLD_RESET: invalid device '" + tokens[1] + "'");
+
+	// This deliberately resets only the selected peripheral. A guest remains
+	// executing while its SIO device drops queued state.
+	dev->ColdReset();
+	std::string payload = BuildDevicePayload(sim, tokens[1], true, dev);
+	payload += ",\"lifecycle\":\"cold\"";
+	return JsonOk(payload);
+}
+
 std::string CmdDeviceRemove(ATSimulator& sim, const std::vector<std::string>& tokens) {
 	if (tokens.size() != 2)
 		return JsonError("DEVICE_REMOVE: usage: DEVICE_REMOVE <tag-or-path>");

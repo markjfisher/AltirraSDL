@@ -889,6 +889,10 @@ class AltirraBridge:
         suffix = (" " + " ".join(opts)) if opts else ""
         return self._cmd_ok(f"DEVICE_SET {tag} {state}{suffix}")
 
+    def device_cold_reset(self, tag: str) -> dict:
+        """Run ``ColdReset()`` on one installed device without resetting the Atari."""
+        return self._cmd_ok("DEVICE_COLD_RESET " + _quote_token(tag))
+
     def device_remove(self, tag: str) -> dict:
         """Remove one non-internal device by tag or device-tree path."""
         return self._cmd_ok("DEVICE_REMOVE " + _quote_token(tag))

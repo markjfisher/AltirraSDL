@@ -242,6 +242,7 @@ a.device_add("printer", parent="/", translation_mode="default")
 a.device_add("fx80", parent="/printer/parport", auto_lf=True, intl_mode=1)
 a.device_set("vbxe", True, version=126, base="d600")
 a.device_set("soundboard", True, version=120, base="d2c0")
+a.device_cold_reset("fujinetnio")
 a.device_remove("rapidus")
 a.device_clear()
 ```
