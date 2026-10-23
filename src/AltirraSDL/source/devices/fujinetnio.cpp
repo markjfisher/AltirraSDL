@@ -50,7 +50,7 @@ public:
 
 	fujinet::io::IOResponse handle(const fujinet::io::IORequest& request) override {
 		const bool expected = request.deviceId == 1 &&
-			(request.command == 2 || request.command == 3) &&
+			(request.command == 2 || request.command == 3 || request.command == 4) &&
 			request.params.empty() && request.payload.empty();
 		if (!expected)
 			return fujinet::io::make_base_response(
@@ -66,7 +66,8 @@ public:
 		// pass by replaying the discarded first request.
 		response.payload = request.command == 2 ?
 			std::vector<std::uint8_t>{0xaa, 0x55} :
-			std::vector<std::uint8_t>{0x33, 0xcc};
+			request.command == 3 ? std::vector<std::uint8_t>{0x33, 0xcc} :
+			std::vector<std::uint8_t>{0x5a, 0xa5};
 		return response;
 	}
 
@@ -112,12 +113,19 @@ private:
 	std::unique_ptr<fujinet::io::AtariSioNioFrontend> mNio;
 	VDStringW mConfigDir{L"./fujinet-data"};
 	bool mProjectionFixture = false;
+	// Test-only Altirra scheduling fault. It is deliberately downstream of
+	// AtariSioNioFrontend: the endpoint accepts and consumes terminal R before
+	// a corrupted serial checksum reaches the guest.
+	bool mProjectionInterruptTerminalR = false;
+	bool mProjectionTerminalRFaultInjected = false;
+	std::uint8_t mActiveNioCommand = 0;
 	std::uint32_t mProjectionDispatches = 0;
 	bool mbCoreReady = false;
 	std::size_t mExpectedWriteBytes = 0;
 	std::vector<std::uint8_t> mPendingWrite;
 	// Result bytes are retained until Altirra's queued SIO send has drained.
 	std::vector<std::uint8_t> mScheduledReply;
+	std::vector<std::uint8_t> mFaultScheduledReply;
 };
 
 } // namespace
@@ -165,17 +173,27 @@ void ATDeviceFujiNetNIO::GetSettings(ATPropertySet& settings) {
 	settings.SetString("configdir", mConfigDir.c_str());
 	if (mProjectionFixture)
 		settings.SetBool("projectionfixture", true);
+	if (mProjectionInterruptTerminalR)
+		settings.SetBool("projectioninterruptterminalr", true);
 }
 
 bool ATDeviceFujiNetNIO::SetSettings(const ATPropertySet& settings) {
 	const VDStringW newConfigDir(settings.GetString("configdir", L"./fujinet-data"));
 	const bool newProjectionFixture = settings.GetBool("projectionfixture", false);
+	const bool newProjectionInterruptTerminalR = settings.GetBool("projectioninterruptterminalr", false);
+	if (newProjectionInterruptTerminalR && !newProjectionFixture) {
+		FN_LOGE(kTag, "projectioninterruptterminalr requires projectionfixture=true");
+		return false;
+	}
 	if (mbCoreReady &&
-		(newConfigDir != mConfigDir || newProjectionFixture != mProjectionFixture)) {
+		(newConfigDir != mConfigDir || newProjectionFixture != mProjectionFixture ||
+		 newProjectionInterruptTerminalR != mProjectionInterruptTerminalR)) {
 		FN_LOGW(kTag, "embedded FujiNet-NIO settings changes take effect after removing and re-adding the device");
 	}
 	mConfigDir = newConfigDir;
 	mProjectionFixture = newProjectionFixture;
+	mProjectionInterruptTerminalR = newProjectionInterruptTerminalR;
+	mProjectionTerminalRFaultInjected = false;
 	return true;
 }
 
@@ -189,6 +207,7 @@ void ATDeviceFujiNetNIO::Shutdown() {
 void ATDeviceFujiNetNIO::ColdReset() {
 	FN_LOGI(kTag, "embedded FujiNet-NIO device ColdReset");
 	ClearPendingWrite();
+	mProjectionTerminalRFaultInjected = false;
 	if (mNio)
 		mNio->reset();
 }
@@ -343,6 +362,7 @@ IATDeviceSIO::CmdResponse ATDeviceFujiNetNIO::BeginCommand(const ATDeviceSIOComm
 	std::array<std::uint8_t, fujinet::io::AtariSioNioFrontend::command_bytes> frame{
 		cmd.mDevice, cmd.mCommand, cmd.mAUX[0], cmd.mAUX[1], 0};
 	frame.back() = fujinet::io::AtariSioNioFrontend::checksum(frame.data(), frame.size() - 1);
+	mActiveNioCommand = cmd.mCommand;
 	const auto result = mNio->begin(frame);
 
 	mpSIOInterface->BeginCommand();
@@ -425,7 +445,26 @@ void ATDeviceFujiNetNIO::SendResult(const fujinet::io::AtariSioNioFrontend::Resu
 	}
 
 	mpSIOInterface->SendComplete();
-	if (payload_bytes)
-		mpSIOInterface->SendData(mScheduledReply.data() + 2, static_cast<uint32>(payload_bytes), true);
+	if (payload_bytes) {
+		const bool interruptTerminalR = mProjectionInterruptTerminalR &&
+			!mProjectionTerminalRFaultInjected && mActiveNioCommand == 'R';
+		if (interruptTerminalR) {
+			mProjectionTerminalRFaultInjected = true;
+			// SendData(false) exposes the literal raw serial bytes to Altirra's
+			// SIO scheduler.  Retain the corrupt delivery frame separately from
+			// mScheduledReply, whose unmodified bytes remain the endpoint's
+			// accepted response ownership.
+			mFaultScheduledReply.assign(mScheduledReply.begin() + 2,
+				mScheduledReply.begin() + 2 + payload_bytes);
+			mFaultScheduledReply.push_back(static_cast<std::uint8_t>(checksum ^ 0x01));
+			FN_LOGI(kTag, "projection fault: accepted terminal R checksum %02x delivered as %02x",
+				checksum, mFaultScheduledReply.back());
+			mpSIOInterface->SendData(mFaultScheduledReply.data(),
+				static_cast<uint32>(mFaultScheduledReply.size()), false);
+		} else {
+			mpSIOInterface->SendData(mScheduledReply.data() + 2,
+				static_cast<uint32>(payload_bytes), true);
+		}
+	}
 	mpSIOInterface->EndCommand();
 }
