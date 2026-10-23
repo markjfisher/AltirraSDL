@@ -3,6 +3,7 @@
 # SIO manager; it deliberately does not model Q/W/P/R itself.
 add_executable(altirra-fujinet-nio-sio-test
     ../fujinetnio.cpp
+    ${ALTIRRA_FUJINET_NIO_SOURCE_DIR}/src/platform/posix/time.cpp
     fujinetnio_sio_test.cpp)
 
 target_include_directories(altirra-fujinet-nio-sio-test PRIVATE
@@ -13,7 +14,10 @@ target_include_directories(altirra-fujinet-nio-sio-test PRIVATE
     ${PROJECT_SOURCE_DIR}/src/compat
     ${PROJECT_SOURCE_DIR}/src/Altirra/autobuild_default)
 
-target_compile_definitions(altirra-fujinet-nio-sio-test PRIVATE ALTIRRA_FUJINET_NIO=1)
+target_compile_definitions(altirra-fujinet-nio-sio-test PRIVATE
+    ALTIRRA_FUJINET_NIO=1
+    ALTIRRA_FUJINET_NIO_TEST_CLOCK=1
+    FN_POSIX_TEST_CLOCK=1)
 target_link_libraries(altirra-fujinet-nio-sio-test PRIVATE
     fujinet-nio ATCPU ATEmulation ATDevices ATIO ATAudio ATNetwork
     ATNetworkSockets ATDebugger ATVM ATCore Kasumi vdjson system SDL3::SDL3)
