@@ -282,6 +282,12 @@ private:
 	bool mPublicAcceptanceMalformedReadyAwaitingWrite = false;
 	bool mPublicAcceptanceMalformedReadyArmed = false;
 	bool mPublicAcceptanceMalformedReadyInjected = false;
+	// Test-only public-API terminal-R fault. The frontend consumes the accepted
+	// response before only its downstream scheduled checksum is corrupted.
+	bool mPublicAcceptanceInterruptTerminalR = false;
+	bool mPublicAcceptanceInterruptTerminalRAwaitingWrite = false;
+	bool mPublicAcceptanceInterruptTerminalRArmed = false;
+	bool mPublicAcceptanceInterruptTerminalRInjected = false;
 	// Test-only Altirra scheduling fault. It is deliberately downstream of
 	// AtariSioNioFrontend: the endpoint accepts and consumes terminal R before
 	// a corrupted serial checksum reaches the guest.
@@ -348,6 +354,8 @@ void ATDeviceFujiNetNIO::GetSettings(ATPropertySet& settings) {
 		settings.SetBool("publicacceptancerejectfilew", true);
 	if (mPublicAcceptanceMalformedReadyLength)
 		settings.SetBool("publicacceptancemalformedreadylength", true);
+	if (mPublicAcceptanceInterruptTerminalR)
+		settings.SetBool("publicacceptanceinterruptterminalr", true);
 	if (mProjectionInterruptTerminalR)
 		settings.SetBool("projectioninterruptterminalr", true);
 }
@@ -359,6 +367,8 @@ bool ATDeviceFujiNetNIO::SetSettings(const ATPropertySet& settings) {
 	const bool newPublicAcceptanceRejectFileW = settings.GetBool("publicacceptancerejectfilew", false);
 	const bool newPublicAcceptanceMalformedReadyLength = settings.GetBool(
 		"publicacceptancemalformedreadylength", false);
+	const bool newPublicAcceptanceInterruptTerminalR = settings.GetBool(
+		"publicacceptanceinterruptterminalr", false);
 	const bool newProjectionInterruptTerminalR = settings.GetBool("projectioninterruptterminalr", false);
 	if (newProjectionInterruptTerminalR && !newProjectionFixture) {
 		FN_LOGE(kTag, "projectioninterruptterminalr requires projectionfixture=true");
@@ -376,8 +386,14 @@ bool ATDeviceFujiNetNIO::SetSettings(const ATPropertySet& settings) {
 		FN_LOGE(kTag, "publicacceptancemalformedreadylength requires publicacceptancefixture=true");
 		return false;
 	}
-	if (newPublicAcceptanceRejectFileW && newPublicAcceptanceMalformedReadyLength) {
-		FN_LOGE(kTag, "public acceptance W rejection and READY-length faults are mutually exclusive");
+	if (newPublicAcceptanceInterruptTerminalR && !newPublicAcceptanceFixture) {
+		FN_LOGE(kTag, "publicacceptanceinterruptterminalr requires publicacceptancefixture=true");
+		return false;
+	}
+	if ((newPublicAcceptanceRejectFileW && newPublicAcceptanceMalformedReadyLength) ||
+		(newPublicAcceptanceRejectFileW && newPublicAcceptanceInterruptTerminalR) ||
+		(newPublicAcceptanceMalformedReadyLength && newPublicAcceptanceInterruptTerminalR)) {
+		FN_LOGE(kTag, "public acceptance recovery faults are mutually exclusive");
 		return false;
 	}
 	if (mbCoreReady &&
@@ -385,6 +401,7 @@ bool ATDeviceFujiNetNIO::SetSettings(const ATPropertySet& settings) {
 		 newPublicAcceptanceFixture != mPublicAcceptanceFixture ||
 		 newPublicAcceptanceRejectFileW != mPublicAcceptanceRejectFileW ||
 		 newPublicAcceptanceMalformedReadyLength != mPublicAcceptanceMalformedReadyLength ||
+		 newPublicAcceptanceInterruptTerminalR != mPublicAcceptanceInterruptTerminalR ||
 		 newProjectionInterruptTerminalR != mProjectionInterruptTerminalR)) {
 		FN_LOGW(kTag, "embedded FujiNet-NIO settings changes take effect after removing and re-adding the device");
 	}
@@ -397,6 +414,10 @@ bool ATDeviceFujiNetNIO::SetSettings(const ATPropertySet& settings) {
 	mPublicAcceptanceMalformedReadyAwaitingWrite = false;
 	mPublicAcceptanceMalformedReadyArmed = false;
 	mPublicAcceptanceMalformedReadyInjected = false;
+	mPublicAcceptanceInterruptTerminalR = newPublicAcceptanceInterruptTerminalR;
+	mPublicAcceptanceInterruptTerminalRAwaitingWrite = false;
+	mPublicAcceptanceInterruptTerminalRArmed = false;
+	mPublicAcceptanceInterruptTerminalRInjected = false;
 	mProjectionInterruptTerminalR = newProjectionInterruptTerminalR;
 	mProjectionTerminalRFaultInjected = false;
 	return true;
@@ -644,6 +665,8 @@ IATDeviceSIO::CmdResponse ATDeviceFujiNetNIO::BeginCommand(const ATDeviceSIOComm
 	const auto result = mNio->begin(frame);
 	if (mPublicAcceptanceMalformedReadyLength && selectedInitialFileWrite && result.accepted)
 		mPublicAcceptanceMalformedReadyAwaitingWrite = true;
+	if (mPublicAcceptanceInterruptTerminalR && selectedInitialFileWrite && result.accepted)
+		mPublicAcceptanceInterruptTerminalRAwaitingWrite = true;
 
 	mpSIOInterface->BeginCommand();
 	mpSIOInterface->Delay(kCommandAckDelayCycles);
@@ -686,6 +709,9 @@ void ATDeviceFujiNetNIO::ProcessPendingWrite() {
 	if (mPublicAcceptanceMalformedReadyAwaitingWrite && result.accepted)
 		mPublicAcceptanceMalformedReadyArmed = true;
 	mPublicAcceptanceMalformedReadyAwaitingWrite = false;
+	if (mPublicAcceptanceInterruptTerminalRAwaitingWrite && result.accepted)
+		mPublicAcceptanceInterruptTerminalRArmed = true;
+	mPublicAcceptanceInterruptTerminalRAwaitingWrite = false;
 	ClearPendingWrite();
 	mScheduledReply = result.bytes;
 	if (!result.accepted || mScheduledReply.empty() || mScheduledReply.front() != 'A') {
@@ -753,24 +779,43 @@ void ATDeviceFujiNetNIO::SendResult(const fujinet::io::AtariSioNioFrontend::Resu
 			mpSIOInterface->SendData(mFaultScheduledReply.data(),
 				static_cast<uint32>(mFaultScheduledReply.size()), true);
 		} else {
-			const bool interruptTerminalR = mProjectionInterruptTerminalR &&
-				!mProjectionTerminalRFaultInjected && mActiveNioCommand == 'R';
-			if (interruptTerminalR) {
-				mProjectionTerminalRFaultInjected = true;
-				// SendData(false) exposes the literal raw serial bytes to Altirra's
-				// SIO scheduler.  Retain the corrupt delivery frame separately from
-				// mScheduledReply, whose unmodified bytes remain the endpoint's
-				// accepted response ownership.
+			const bool interruptPublicTerminalR = mPublicAcceptanceInterruptTerminalR &&
+				mPublicAcceptanceInterruptTerminalRArmed &&
+				!mPublicAcceptanceInterruptTerminalRInjected && mActiveNioCommand == 'R';
+			if (interruptPublicTerminalR) {
+				mPublicAcceptanceInterruptTerminalRInjected = true;
+				mPublicAcceptanceInterruptTerminalRArmed = false;
+				// The production frontend has already accepted R and consumed its
+				// outstanding slot. Keep the separately corrupted serial delivery
+				// out of mScheduledReply so it cannot change endpoint ownership.
 				mFaultScheduledReply.assign(mScheduledReply.begin() + 2,
 					mScheduledReply.begin() + 2 + payload_bytes);
 				mFaultScheduledReply.push_back(static_cast<std::uint8_t>(checksum ^ 0x01));
-				FN_LOGI(kTag, "projection fault: accepted terminal R checksum %02x delivered as %02x",
+				FN_LOGI(kAcceptanceTag,
+					"fault: public File terminal R checksum %02x delivered as %02x",
 					checksum, mFaultScheduledReply.back());
 				mpSIOInterface->SendData(mFaultScheduledReply.data(),
 					static_cast<uint32>(mFaultScheduledReply.size()), false);
 			} else {
-				mpSIOInterface->SendData(mScheduledReply.data() + 2,
-					static_cast<uint32>(payload_bytes), true);
+				const bool interruptTerminalR = mProjectionInterruptTerminalR &&
+					!mProjectionTerminalRFaultInjected && mActiveNioCommand == 'R';
+				if (interruptTerminalR) {
+					mProjectionTerminalRFaultInjected = true;
+					// SendData(false) exposes the literal raw serial bytes to Altirra's
+					// SIO scheduler.  Retain the corrupt delivery frame separately from
+					// mScheduledReply, whose unmodified bytes remain the endpoint's
+					// accepted response ownership.
+					mFaultScheduledReply.assign(mScheduledReply.begin() + 2,
+						mScheduledReply.begin() + 2 + payload_bytes);
+					mFaultScheduledReply.push_back(static_cast<std::uint8_t>(checksum ^ 0x01));
+					FN_LOGI(kTag, "projection fault: accepted terminal R checksum %02x delivered as %02x",
+						checksum, mFaultScheduledReply.back());
+					mpSIOInterface->SendData(mFaultScheduledReply.data(),
+						static_cast<uint32>(mFaultScheduledReply.size()), false);
+				} else {
+					mpSIOInterface->SendData(mScheduledReply.data() + 2,
+						static_cast<uint32>(payload_bytes), true);
+				}
 			}
 		}
 	}
