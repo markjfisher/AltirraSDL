@@ -275,6 +275,13 @@ private:
 	bool mPublicAcceptanceFixture = false;
 	bool mPublicAcceptanceRejectFileW = false;
 	std::uint32_t mPublicAcceptanceRejectedFileWAttempts = 0;
+	// Test-only public-API retention fault. It changes the one READY length
+	// scheduled to the Atari after the production frontend has queued the real
+	// File response; mScheduledReply remains untouched for recovery P/R.
+	bool mPublicAcceptanceMalformedReadyLength = false;
+	bool mPublicAcceptanceMalformedReadyAwaitingWrite = false;
+	bool mPublicAcceptanceMalformedReadyArmed = false;
+	bool mPublicAcceptanceMalformedReadyInjected = false;
 	// Test-only Altirra scheduling fault. It is deliberately downstream of
 	// AtariSioNioFrontend: the endpoint accepts and consumes terminal R before
 	// a corrupted serial checksum reaches the guest.
@@ -339,6 +346,8 @@ void ATDeviceFujiNetNIO::GetSettings(ATPropertySet& settings) {
 		settings.SetBool("publicacceptancefixture", true);
 	if (mPublicAcceptanceRejectFileW)
 		settings.SetBool("publicacceptancerejectfilew", true);
+	if (mPublicAcceptanceMalformedReadyLength)
+		settings.SetBool("publicacceptancemalformedreadylength", true);
 	if (mProjectionInterruptTerminalR)
 		settings.SetBool("projectioninterruptterminalr", true);
 }
@@ -348,6 +357,8 @@ bool ATDeviceFujiNetNIO::SetSettings(const ATPropertySet& settings) {
 	const bool newProjectionFixture = settings.GetBool("projectionfixture", false);
 	const bool newPublicAcceptanceFixture = settings.GetBool("publicacceptancefixture", false);
 	const bool newPublicAcceptanceRejectFileW = settings.GetBool("publicacceptancerejectfilew", false);
+	const bool newPublicAcceptanceMalformedReadyLength = settings.GetBool(
+		"publicacceptancemalformedreadylength", false);
 	const bool newProjectionInterruptTerminalR = settings.GetBool("projectioninterruptterminalr", false);
 	if (newProjectionInterruptTerminalR && !newProjectionFixture) {
 		FN_LOGE(kTag, "projectioninterruptterminalr requires projectionfixture=true");
@@ -361,10 +372,19 @@ bool ATDeviceFujiNetNIO::SetSettings(const ATPropertySet& settings) {
 		FN_LOGE(kTag, "publicacceptancerejectfilew requires publicacceptancefixture=true");
 		return false;
 	}
+	if (newPublicAcceptanceMalformedReadyLength && !newPublicAcceptanceFixture) {
+		FN_LOGE(kTag, "publicacceptancemalformedreadylength requires publicacceptancefixture=true");
+		return false;
+	}
+	if (newPublicAcceptanceRejectFileW && newPublicAcceptanceMalformedReadyLength) {
+		FN_LOGE(kTag, "public acceptance W rejection and READY-length faults are mutually exclusive");
+		return false;
+	}
 	if (mbCoreReady &&
 		(newConfigDir != mConfigDir || newProjectionFixture != mProjectionFixture ||
 		 newPublicAcceptanceFixture != mPublicAcceptanceFixture ||
 		 newPublicAcceptanceRejectFileW != mPublicAcceptanceRejectFileW ||
+		 newPublicAcceptanceMalformedReadyLength != mPublicAcceptanceMalformedReadyLength ||
 		 newProjectionInterruptTerminalR != mProjectionInterruptTerminalR)) {
 		FN_LOGW(kTag, "embedded FujiNet-NIO settings changes take effect after removing and re-adding the device");
 	}
@@ -373,6 +393,10 @@ bool ATDeviceFujiNetNIO::SetSettings(const ATPropertySet& settings) {
 	mPublicAcceptanceFixture = newPublicAcceptanceFixture;
 	mPublicAcceptanceRejectFileW = newPublicAcceptanceRejectFileW;
 	mPublicAcceptanceRejectedFileWAttempts = 0;
+	mPublicAcceptanceMalformedReadyLength = newPublicAcceptanceMalformedReadyLength;
+	mPublicAcceptanceMalformedReadyAwaitingWrite = false;
+	mPublicAcceptanceMalformedReadyArmed = false;
+	mPublicAcceptanceMalformedReadyInjected = false;
 	mProjectionInterruptTerminalR = newProjectionInterruptTerminalR;
 	mProjectionTerminalRFaultInjected = false;
 	return true;
@@ -606,9 +630,10 @@ IATDeviceSIO::CmdResponse ATDeviceFujiNetNIO::BeginCommand(const ATDeviceSIOComm
 	std::array<std::uint8_t, fujinet::io::AtariSioNioFrontend::command_bytes> frame{
 		cmd.mDevice, cmd.mCommand, cmd.mAUX[0], cmd.mAUX[1], 0};
 	frame.back() = fujinet::io::AtariSioNioFrontend::checksum(frame.data(), frame.size() - 1);
-	if (mPublicAcceptanceRejectFileW && cmd.mCommand == 'W' &&
+	const bool selectedInitialFileWrite = cmd.mCommand == 'W' &&
 		(cmd.mAUX[0] | (static_cast<std::uint16_t>(cmd.mAUX[1]) << 8)) ==
-			kAcceptanceInitialFileWriteBytes) {
+			kAcceptanceInitialFileWriteBytes;
+	if (mPublicAcceptanceRejectFileW && selectedInitialFileWrite) {
 		const auto originalChecksum = frame.back();
 		frame.back() ^= 0x01;
 		FN_LOGI(kAcceptanceTag,
@@ -617,6 +642,8 @@ IATDeviceSIO::CmdResponse ATDeviceFujiNetNIO::BeginCommand(const ATDeviceSIOComm
 	}
 	mActiveNioCommand = cmd.mCommand;
 	const auto result = mNio->begin(frame);
+	if (mPublicAcceptanceMalformedReadyLength && selectedInitialFileWrite && result.accepted)
+		mPublicAcceptanceMalformedReadyAwaitingWrite = true;
 
 	mpSIOInterface->BeginCommand();
 	mpSIOInterface->Delay(kCommandAckDelayCycles);
@@ -656,6 +683,9 @@ void ATDeviceFujiNetNIO::ProcessPendingWrite() {
 	}
 
 	const auto result = mNio->complete_write(mPendingWrite.data(), mPendingWrite.size());
+	if (mPublicAcceptanceMalformedReadyAwaitingWrite && result.accepted)
+		mPublicAcceptanceMalformedReadyArmed = true;
+	mPublicAcceptanceMalformedReadyAwaitingWrite = false;
 	ClearPendingWrite();
 	mScheduledReply = result.bytes;
 	if (!result.accepted || mScheduledReply.empty() || mScheduledReply.front() != 'A') {
@@ -699,24 +729,49 @@ void ATDeviceFujiNetNIO::SendResult(const fujinet::io::AtariSioNioFrontend::Resu
 
 	mpSIOInterface->SendComplete();
 	if (payload_bytes) {
-		const bool interruptTerminalR = mProjectionInterruptTerminalR &&
-			!mProjectionTerminalRFaultInjected && mActiveNioCommand == 'R';
-		if (interruptTerminalR) {
-			mProjectionTerminalRFaultInjected = true;
-			// SendData(false) exposes the literal raw serial bytes to Altirra's
-			// SIO scheduler.  Retain the corrupt delivery frame separately from
-			// mScheduledReply, whose unmodified bytes remain the endpoint's
-			// accepted response ownership.
+		const bool malformedReadyLength = mPublicAcceptanceMalformedReadyLength &&
+			mPublicAcceptanceMalformedReadyArmed && !mPublicAcceptanceMalformedReadyInjected &&
+			mActiveNioCommand == 'P' && payload_bytes == 3 && mScheduledReply[2] == 2;
+		if (malformedReadyLength) {
+			const auto originalLength = static_cast<std::uint16_t>(mScheduledReply[3]) |
+				(static_cast<std::uint16_t>(mScheduledReply[4]) << 8);
+			if (originalLength == 0) {
+				mpSIOInterface->SendNAK();
+				mpSIOInterface->EndCommand();
+				return;
+			}
+			const auto deliveredLength = static_cast<std::uint16_t>(originalLength - 1);
+			mPublicAcceptanceMalformedReadyInjected = true;
+			mPublicAcceptanceMalformedReadyArmed = false;
 			mFaultScheduledReply.assign(mScheduledReply.begin() + 2,
 				mScheduledReply.begin() + 2 + payload_bytes);
-			mFaultScheduledReply.push_back(static_cast<std::uint8_t>(checksum ^ 0x01));
-			FN_LOGI(kTag, "projection fault: accepted terminal R checksum %02x delivered as %02x",
-				checksum, mFaultScheduledReply.back());
+			mFaultScheduledReply[1] = static_cast<std::uint8_t>(deliveredLength);
+			mFaultScheduledReply[2] = static_cast<std::uint8_t>(deliveredLength >> 8);
+			FN_LOGI(kAcceptanceTag,
+				"fault: File P READY length %u delivered as %u",
+				static_cast<unsigned>(originalLength), static_cast<unsigned>(deliveredLength));
 			mpSIOInterface->SendData(mFaultScheduledReply.data(),
-				static_cast<uint32>(mFaultScheduledReply.size()), false);
+				static_cast<uint32>(mFaultScheduledReply.size()), true);
 		} else {
-			mpSIOInterface->SendData(mScheduledReply.data() + 2,
-				static_cast<uint32>(payload_bytes), true);
+			const bool interruptTerminalR = mProjectionInterruptTerminalR &&
+				!mProjectionTerminalRFaultInjected && mActiveNioCommand == 'R';
+			if (interruptTerminalR) {
+				mProjectionTerminalRFaultInjected = true;
+				// SendData(false) exposes the literal raw serial bytes to Altirra's
+				// SIO scheduler.  Retain the corrupt delivery frame separately from
+				// mScheduledReply, whose unmodified bytes remain the endpoint's
+				// accepted response ownership.
+				mFaultScheduledReply.assign(mScheduledReply.begin() + 2,
+					mScheduledReply.begin() + 2 + payload_bytes);
+				mFaultScheduledReply.push_back(static_cast<std::uint8_t>(checksum ^ 0x01));
+				FN_LOGI(kTag, "projection fault: accepted terminal R checksum %02x delivered as %02x",
+					checksum, mFaultScheduledReply.back());
+				mpSIOInterface->SendData(mFaultScheduledReply.data(),
+					static_cast<uint32>(mFaultScheduledReply.size()), false);
+			} else {
+				mpSIOInterface->SendData(mScheduledReply.data() + 2,
+					static_cast<uint32>(payload_bytes), true);
+			}
 		}
 	}
 	mpSIOInterface->EndCommand();
