@@ -155,6 +155,27 @@ std::vector<std::uint8_t> ReadFixture(const char *path) {
 	return {0x01, 0x02, 0x06, 0x00, 0x09, 0x00};
 }
 
+std::vector<std::uint8_t> PublicFileWriteRequest() {
+	// This is the literal FileDevice WriteFile application payload used by the
+	// public acceptance XEX. The production frontend and real FileDevice still
+	// own every SIO and FujiBus response in this test.
+	static constexpr const char kUri[] = "persist:///fnaccept-v1.bin";
+	static constexpr const char kMarker[] = "ATARI-FILE-24";
+	std::vector<std::uint8_t> packet{0xfe, 0x04, 0, 0, 0, 0, 0x01,
+		static_cast<std::uint8_t>(sizeof(kUri) - 1), 0x00};
+	packet.insert(packet.end(), kUri, kUri + sizeof(kUri) - 1);
+	packet.insert(packet.end(), {0, 0, 0, 0,
+		static_cast<std::uint8_t>(sizeof(kMarker) - 1), 0x00});
+	packet.insert(packet.end(), kMarker, kMarker + sizeof(kMarker) - 1);
+	Check(packet.size() == 54, "public File Write has the known 54-byte packet length");
+	packet[2] = static_cast<std::uint8_t>(packet.size());
+	std::vector<std::uint8_t> checksumBytes(packet.begin(), packet.begin() + 4);
+	checksumBytes.insert(checksumBytes.end(), packet.begin() + 5, packet.end());
+	packet[4] = fujinet::io::AtariSioNioFrontend::checksum(
+		checksumBytes.data(), checksumBytes.size());
+	return packet;
+}
+
 void ExpectStatus(const FakeSIO& sio, const std::vector<std::uint8_t>& bytes, const char *message) {
 	if (sio.transmitted != bytes)
 		Fail(message);
@@ -307,6 +328,61 @@ int main(int argc, char **argv) {
 
 	device->Shutdown();
 	device->Release();
+
+	// Build a separate real device with the public malformed-READY delivery
+	// fault. The initial File W is accepted and routed, but only the first
+	// READY length scheduled to the guest is changed. A rejected terminal R
+	// must leave the production frontend's original response available.
+	ATPropertySet malformedSettings;
+	malformedSettings.SetString("configdir", VDTextAToW(config.c_str()).c_str());
+	malformedSettings.SetBool("publicacceptancefixture", true);
+	malformedSettings.SetBool("publicacceptancemalformedreadylength", true);
+	IATDevice *malformedDevice = nullptr;
+	ATCreateDeviceFujiNetNIO(malformedSettings, &malformedDevice);
+	Check(malformedDevice != nullptr, "malformed READY device factory returned embedded device");
+	auto *malformedSioDevice = static_cast<IATDeviceSIO *>(
+		malformedDevice->AsInterface(IATDeviceSIO::kTypeID));
+	Check(malformedSioDevice != nullptr, "malformed READY device exposes IATDeviceSIO");
+	FakeSIOManager malformedManager;
+	malformedSioDevice->InitSIO(&malformedManager);
+	FakeSIO& malformedSio = *malformedManager.mSIO;
+	const auto fileRequest = PublicFileWriteRequest();
+	const auto fileChecksum = fujinet::io::AtariSioNioFrontend::checksum(
+		fileRequest.data(), fileRequest.size());
+	std::vector<std::uint8_t> framedFileRequest = fileRequest;
+	framedFileRequest.push_back(fileChecksum);
+	Check(malformedSioDevice->OnSerialBeginCommand(Command(0x7f, 'W', fileRequest.size())) ==
+		IATDeviceSIO::kCmdResponse_Start, "public File W for malformed READY starts");
+	ExpectStatus(malformedSio, {'A'}, "public File W command ACK is exact");
+	malformedSioDevice->OnSerialReceiveComplete(malformedSio.receiveId,
+		framedFileRequest.data(), framedFileRequest.size(), true);
+	malformedSioDevice->OnSerialFence(malformedSio.fenceId);
+	ExpectStatus(malformedSio, {'A', 'A', 'C'}, "public File W reaches production FileDevice");
+
+	malformedSio.Clear();
+	Check(malformedSioDevice->OnSerialBeginCommand(Command(0x7f, 'P', 0)) ==
+		IATDeviceSIO::kCmdResponse_Start, "faulted READY P starts");
+	ExpectStatus(malformedSio, {'A', 'C', 2, 16, 0, 18},
+		"only the delivered READY length is decremented with a valid checksum");
+	malformedSio.Clear();
+	Check(malformedSioDevice->OnSerialBeginCommand(Command(0x7f, 'R', 16)) ==
+		IATDeviceSIO::kCmdResponse_Start, "wrong READY-derived R starts");
+	ExpectStatus(malformedSio, {'N'}, "wrong READY-derived R is NAKed and retained");
+
+	malformedSio.Clear();
+	Check(malformedSioDevice->OnSerialBeginCommand(Command(0x7f, 'P', 0)) ==
+		IATDeviceSIO::kCmdResponse_Start, "retained response P starts");
+	ExpectStatus(malformedSio, {'A', 'C', 2, 17, 0, 19},
+		"retained READY response restores the production length");
+	malformedSio.Clear();
+	Check(malformedSioDevice->OnSerialBeginCommand(Command(0x7f, 'R', 17)) ==
+		IATDeviceSIO::kCmdResponse_Start, "correct retained R starts");
+	Check(malformedSio.transmitted.size() == 20 && malformedSio.transmitted[0] == 'A' &&
+		malformedSio.transmitted[1] == 'C' && malformedSio.transmitted.back() ==
+		fujinet::io::AtariSioNioFrontend::checksum(malformedSio.transmitted.data() + 2, 17),
+		"correct retained R sends the original complete File response");
+	malformedDevice->Shutdown();
+	malformedDevice->Release();
 	std::filesystem::remove_all(temp);
 	std::puts("Altirra embedded FujiNet-NIO SIO adapter test passed");
 	return 0;
