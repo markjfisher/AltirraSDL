@@ -49,7 +49,8 @@ public:
 		: mDispatches(dispatches) {}
 
 	fujinet::io::IOResponse handle(const fujinet::io::IORequest& request) override {
-		const bool expected = request.deviceId == 1 && request.command == 2 &&
+		const bool expected = request.deviceId == 1 &&
+			(request.command == 2 || request.command == 3) &&
 			request.params.empty() && request.payload.empty();
 		if (!expected)
 			return fujinet::io::make_base_response(
@@ -60,7 +61,12 @@ public:
 			"[fujinetnio-projection] core dispatch fixture route invocation %u\n",
 			mDispatches);
 		auto response = fujinet::io::make_success_response(request);
-		response.payload = {0xaa, 0x55};
+		// The reset projection's W2 is intentionally distinct from W1.  Keep
+		// that distinction in the deterministic downstream route so it cannot
+		// pass by replaying the discarded first request.
+		response.payload = request.command == 2 ?
+			std::vector<std::uint8_t>{0xaa, 0x55} :
+			std::vector<std::uint8_t>{0x33, 0xcc};
 		return response;
 	}
 
@@ -181,6 +187,7 @@ void ATDeviceFujiNetNIO::Shutdown() {
 }
 
 void ATDeviceFujiNetNIO::ColdReset() {
+	FN_LOGI(kTag, "embedded FujiNet-NIO device ColdReset");
 	ClearPendingWrite();
 	if (mNio)
 		mNio->reset();

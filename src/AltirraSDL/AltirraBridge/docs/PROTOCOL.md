@@ -1169,6 +1169,13 @@ DEVICE_SET modem on parent=850 port=9000 unthrottled=true telnet=false
 `dialaddr` and `dialsvc` are always stored as strings, so a numeric
 service such as `dialsvc=24242` is not turned into a number.
 
+#### `DEVICE_COLD_RESET tag-or-path`
+
+Call `ColdReset()` on one installed device without resetting the Atari
+computer. The response includes the resolved device payload, `"reset":true`,
+and `"lifecycle":"cold"`. This is a peripheral lifecycle operation, so the
+guest CPU remains running.
+
 #### `DEVICE_REMOVE tag-or-path` / `DEVICE_CLEAR`
 
 Remove one non-internal device, or all non-internal devices. Both

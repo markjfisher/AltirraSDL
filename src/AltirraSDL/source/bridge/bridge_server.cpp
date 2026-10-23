@@ -229,6 +229,7 @@ bool ShouldLogCommand(const std::string& verb) {
 		|| verb == "STATE_SAVE" || verb == "STATE_LOAD"
 		|| verb == "STATE_DROP" || verb == "CONFIG"
 		|| verb == "DEVICE_ADD" || verb == "DEVICE_SET" || verb == "DEVICE_REMOVE"
+		|| verb == "DEVICE_COLD_RESET"
 		|| verb == "DEVICE_CLEAR"
 		|| verb == "SCREENSHOT" || verb == "RAWSCREEN"
 		|| verb == "RENDER_FRAME" || verb == "PALETTE_LOAD_ACT"
@@ -520,6 +521,7 @@ std::string Execute(const std::vector<std::string>& tokens, ATSimulator& sim,
 	if (verb == "DEVICE_GET")    return CmdDeviceGet(sim, tokens);
 	if (verb == "DEVICE_ADD")    return CmdDeviceAdd(sim, tokens);
 	if (verb == "DEVICE_SET")    return CmdDeviceSet(sim, tokens);
+	if (verb == "DEVICE_COLD_RESET") return CmdDeviceColdReset(sim, tokens);
 	if (verb == "DEVICE_REMOVE") return CmdDeviceRemove(sim, tokens);
 	if (verb == "DEVICE_CLEAR")  return CmdDeviceClear(sim, tokens);
 
