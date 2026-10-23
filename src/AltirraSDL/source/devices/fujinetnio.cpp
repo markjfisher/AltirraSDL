@@ -58,6 +58,10 @@ static constexpr const char *kAcceptanceDiskPath = "/fnaccept-disk.atr";
 static constexpr std::size_t kAcceptanceDiskSlot = 1; // Guest slot 2.
 static constexpr std::uint16_t kAcceptanceDiskSectorBytes = 128;
 static constexpr std::uint32_t kAcceptanceDiskSectors = 16;
+// The first public File Write is a 54-byte FujiBus packet. The recovery
+// write has a distinct 73-byte packet, so this narrowly targets only the
+// original side-effecting operation and every physical SIO retry of it.
+static constexpr std::uint16_t kAcceptanceInitialFileWriteBytes = 54;
 
 std::uint8_t CapacityPattern(std::size_t packetOffset) {
 	return static_cast<std::uint8_t>(packetOffset ^ (packetOffset >> 8U) ^ 0xa5U);
@@ -269,6 +273,8 @@ private:
 	VDStringW mConfigDir{L"./fujinet-data"};
 	bool mProjectionFixture = false;
 	bool mPublicAcceptanceFixture = false;
+	bool mPublicAcceptanceRejectFileW = false;
+	std::uint32_t mPublicAcceptanceRejectedFileWAttempts = 0;
 	// Test-only Altirra scheduling fault. It is deliberately downstream of
 	// AtariSioNioFrontend: the endpoint accepts and consumes terminal R before
 	// a corrupted serial checksum reaches the guest.
@@ -331,6 +337,8 @@ void ATDeviceFujiNetNIO::GetSettings(ATPropertySet& settings) {
 		settings.SetBool("projectionfixture", true);
 	if (mPublicAcceptanceFixture)
 		settings.SetBool("publicacceptancefixture", true);
+	if (mPublicAcceptanceRejectFileW)
+		settings.SetBool("publicacceptancerejectfilew", true);
 	if (mProjectionInterruptTerminalR)
 		settings.SetBool("projectioninterruptterminalr", true);
 }
@@ -339,6 +347,7 @@ bool ATDeviceFujiNetNIO::SetSettings(const ATPropertySet& settings) {
 	const VDStringW newConfigDir(settings.GetString("configdir", L"./fujinet-data"));
 	const bool newProjectionFixture = settings.GetBool("projectionfixture", false);
 	const bool newPublicAcceptanceFixture = settings.GetBool("publicacceptancefixture", false);
+	const bool newPublicAcceptanceRejectFileW = settings.GetBool("publicacceptancerejectfilew", false);
 	const bool newProjectionInterruptTerminalR = settings.GetBool("projectioninterruptterminalr", false);
 	if (newProjectionInterruptTerminalR && !newProjectionFixture) {
 		FN_LOGE(kTag, "projectioninterruptterminalr requires projectionfixture=true");
@@ -348,15 +357,22 @@ bool ATDeviceFujiNetNIO::SetSettings(const ATPropertySet& settings) {
 		FN_LOGE(kTag, "projectionfixture and publicacceptancefixture are mutually exclusive");
 		return false;
 	}
+	if (newPublicAcceptanceRejectFileW && !newPublicAcceptanceFixture) {
+		FN_LOGE(kTag, "publicacceptancerejectfilew requires publicacceptancefixture=true");
+		return false;
+	}
 	if (mbCoreReady &&
 		(newConfigDir != mConfigDir || newProjectionFixture != mProjectionFixture ||
 		 newPublicAcceptanceFixture != mPublicAcceptanceFixture ||
+		 newPublicAcceptanceRejectFileW != mPublicAcceptanceRejectFileW ||
 		 newProjectionInterruptTerminalR != mProjectionInterruptTerminalR)) {
 		FN_LOGW(kTag, "embedded FujiNet-NIO settings changes take effect after removing and re-adding the device");
 	}
 	mConfigDir = newConfigDir;
 	mProjectionFixture = newProjectionFixture;
 	mPublicAcceptanceFixture = newPublicAcceptanceFixture;
+	mPublicAcceptanceRejectFileW = newPublicAcceptanceRejectFileW;
+	mPublicAcceptanceRejectedFileWAttempts = 0;
 	mProjectionInterruptTerminalR = newProjectionInterruptTerminalR;
 	mProjectionTerminalRFaultInjected = false;
 	return true;
@@ -590,6 +606,15 @@ IATDeviceSIO::CmdResponse ATDeviceFujiNetNIO::BeginCommand(const ATDeviceSIOComm
 	std::array<std::uint8_t, fujinet::io::AtariSioNioFrontend::command_bytes> frame{
 		cmd.mDevice, cmd.mCommand, cmd.mAUX[0], cmd.mAUX[1], 0};
 	frame.back() = fujinet::io::AtariSioNioFrontend::checksum(frame.data(), frame.size() - 1);
+	if (mPublicAcceptanceRejectFileW && cmd.mCommand == 'W' &&
+		(cmd.mAUX[0] | (static_cast<std::uint16_t>(cmd.mAUX[1]) << 8)) ==
+			kAcceptanceInitialFileWriteBytes) {
+		const auto originalChecksum = frame.back();
+		frame.back() ^= 0x01;
+		FN_LOGI(kAcceptanceTag,
+			"fault: File W command checksum %02x delivered as %02x attempt=%u",
+			originalChecksum, frame.back(), ++mPublicAcceptanceRejectedFileWAttempts);
+	}
 	mActiveNioCommand = cmd.mCommand;
 	const auto result = mNio->begin(frame);
 

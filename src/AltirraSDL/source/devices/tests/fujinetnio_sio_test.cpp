@@ -188,6 +188,7 @@ int main(int argc, char **argv) {
 	// cc65 acceptance guest. This still reaches the production endpoint via
 	// the IATDeviceSIO callbacks below; it is not a protocol substitute.
 	settings.SetBool("publicacceptancefixture", true);
+	settings.SetBool("publicacceptancerejectfilew", true);
 
 	IATDevice *device = nullptr;
 	ATCreateDeviceFujiNetNIO(settings, &device);
@@ -207,6 +208,17 @@ int main(int argc, char **argv) {
 	Check(sioDevice->OnSerialBeginCommand(q) == IATDeviceSIO::kCmdResponse_Start, "Q starts");
 	ExpectStatus(sio, {'A', 'C', 1, 0, 2, 0, 0x03}, "Q emits exact native reply");
 	ExpectEvents(sio, {"begin", "delay", "A", "C", "data", "end"}, "Q scheduling order is exact");
+
+	// The acceptance recovery fault alters only the frame passed to the
+	// production frontend. Altirra received the real command callback, but the
+	// frontend must make the actual checksum decision and NAK before data or
+	// core dispatch can happen.
+	sio.Clear();
+	Check(sioDevice->OnSerialBeginCommand(Command(0x7f, 'W', 54)) == IATDeviceSIO::kCmdResponse_Start,
+		"public File W fault reaches adapter");
+	ExpectStatus(sio, {'N'}, "public File W checksum fault is rejected by production frontend");
+	ExpectEvents(sio, {"begin", "delay", "N", "end"},
+		"public File W fault emits NAK before a data phase");
 
 	// $71 is not a native alias and must never claim the SIO transaction.
 	sio.Clear();
