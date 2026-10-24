@@ -288,6 +288,10 @@ private:
 	bool mPublicAcceptanceInterruptTerminalRAwaitingWrite = false;
 	bool mPublicAcceptanceInterruptTerminalRArmed = false;
 	bool mPublicAcceptanceInterruptTerminalRInjected = false;
+	bool mPublicAcceptanceResetAfterReady = false;
+	bool mPublicAcceptanceResetAwaitingWrite = false;
+	bool mPublicAcceptanceResetArmed = false;
+	bool mPublicAcceptanceResetInjected = false;
 	// Test-only Altirra scheduling fault. It is deliberately downstream of
 	// AtariSioNioFrontend: the endpoint accepts and consumes terminal R before
 	// a corrupted serial checksum reaches the guest.
@@ -356,6 +360,8 @@ void ATDeviceFujiNetNIO::GetSettings(ATPropertySet& settings) {
 		settings.SetBool("publicacceptancemalformedreadylength", true);
 	if (mPublicAcceptanceInterruptTerminalR)
 		settings.SetBool("publicacceptanceinterruptterminalr", true);
+	if (mPublicAcceptanceResetAfterReady)
+		settings.SetBool("publicacceptanceresetafterready", true);
 	if (mProjectionInterruptTerminalR)
 		settings.SetBool("projectioninterruptterminalr", true);
 }
@@ -369,6 +375,8 @@ bool ATDeviceFujiNetNIO::SetSettings(const ATPropertySet& settings) {
 		"publicacceptancemalformedreadylength", false);
 	const bool newPublicAcceptanceInterruptTerminalR = settings.GetBool(
 		"publicacceptanceinterruptterminalr", false);
+	const bool newPublicAcceptanceResetAfterReady = settings.GetBool(
+		"publicacceptanceresetafterready", false);
 	const bool newProjectionInterruptTerminalR = settings.GetBool("projectioninterruptterminalr", false);
 	if (newProjectionInterruptTerminalR && !newProjectionFixture) {
 		FN_LOGE(kTag, "projectioninterruptterminalr requires projectionfixture=true");
@@ -390,9 +398,19 @@ bool ATDeviceFujiNetNIO::SetSettings(const ATPropertySet& settings) {
 		FN_LOGE(kTag, "publicacceptanceinterruptterminalr requires publicacceptancefixture=true");
 		return false;
 	}
+	if (newPublicAcceptanceResetAfterReady && !newPublicAcceptanceFixture) {
+		FN_LOGE(kTag, "publicacceptanceresetafterready requires publicacceptancefixture=true");
+		return false;
+	}
 	if ((newPublicAcceptanceRejectFileW && newPublicAcceptanceMalformedReadyLength) ||
 		(newPublicAcceptanceRejectFileW && newPublicAcceptanceInterruptTerminalR) ||
 		(newPublicAcceptanceMalformedReadyLength && newPublicAcceptanceInterruptTerminalR)) {
+		FN_LOGE(kTag, "public acceptance recovery faults are mutually exclusive");
+		return false;
+	}
+	if (newPublicAcceptanceResetAfterReady &&
+		(newPublicAcceptanceRejectFileW || newPublicAcceptanceMalformedReadyLength ||
+		 newPublicAcceptanceInterruptTerminalR)) {
 		FN_LOGE(kTag, "public acceptance recovery faults are mutually exclusive");
 		return false;
 	}
@@ -402,6 +420,7 @@ bool ATDeviceFujiNetNIO::SetSettings(const ATPropertySet& settings) {
 		 newPublicAcceptanceRejectFileW != mPublicAcceptanceRejectFileW ||
 		 newPublicAcceptanceMalformedReadyLength != mPublicAcceptanceMalformedReadyLength ||
 		 newPublicAcceptanceInterruptTerminalR != mPublicAcceptanceInterruptTerminalR ||
+		 newPublicAcceptanceResetAfterReady != mPublicAcceptanceResetAfterReady ||
 		 newProjectionInterruptTerminalR != mProjectionInterruptTerminalR)) {
 		FN_LOGW(kTag, "embedded FujiNet-NIO settings changes take effect after removing and re-adding the device");
 	}
@@ -418,6 +437,10 @@ bool ATDeviceFujiNetNIO::SetSettings(const ATPropertySet& settings) {
 	mPublicAcceptanceInterruptTerminalRAwaitingWrite = false;
 	mPublicAcceptanceInterruptTerminalRArmed = false;
 	mPublicAcceptanceInterruptTerminalRInjected = false;
+	mPublicAcceptanceResetAfterReady = newPublicAcceptanceResetAfterReady;
+	mPublicAcceptanceResetAwaitingWrite = false;
+	mPublicAcceptanceResetArmed = false;
+	mPublicAcceptanceResetInjected = false;
 	mProjectionInterruptTerminalR = newProjectionInterruptTerminalR;
 	mProjectionTerminalRFaultInjected = false;
 	return true;
@@ -667,6 +690,8 @@ IATDeviceSIO::CmdResponse ATDeviceFujiNetNIO::BeginCommand(const ATDeviceSIOComm
 		mPublicAcceptanceMalformedReadyAwaitingWrite = true;
 	if (mPublicAcceptanceInterruptTerminalR && selectedInitialFileWrite && result.accepted)
 		mPublicAcceptanceInterruptTerminalRAwaitingWrite = true;
+	if (mPublicAcceptanceResetAfterReady && selectedInitialFileWrite && result.accepted)
+		mPublicAcceptanceResetAwaitingWrite = true;
 
 	mpSIOInterface->BeginCommand();
 	mpSIOInterface->Delay(kCommandAckDelayCycles);
@@ -712,6 +737,9 @@ void ATDeviceFujiNetNIO::ProcessPendingWrite() {
 	if (mPublicAcceptanceInterruptTerminalRAwaitingWrite && result.accepted)
 		mPublicAcceptanceInterruptTerminalRArmed = true;
 	mPublicAcceptanceInterruptTerminalRAwaitingWrite = false;
+	if (mPublicAcceptanceResetAwaitingWrite && result.accepted)
+		mPublicAcceptanceResetArmed = true;
+	mPublicAcceptanceResetAwaitingWrite = false;
 	ClearPendingWrite();
 	mScheduledReply = result.bytes;
 	if (!result.accepted || mScheduledReply.empty() || mScheduledReply.front() != 'A') {
@@ -779,6 +807,19 @@ void ATDeviceFujiNetNIO::SendResult(const fujinet::io::AtariSioNioFrontend::Resu
 			mpSIOInterface->SendData(mFaultScheduledReply.data(),
 				static_cast<uint32>(mFaultScheduledReply.size()), true);
 		} else {
+			const bool resetAfterReady = mPublicAcceptanceResetAfterReady &&
+				mPublicAcceptanceResetArmed && !mPublicAcceptanceResetInjected &&
+				mActiveNioCommand == 'P' && payload_bytes == 3 && mScheduledReply[2] == 2;
+			if (resetAfterReady) {
+				mPublicAcceptanceResetInjected = true;
+				mPublicAcceptanceResetArmed = false;
+				// Queue the real READY reply first, then invoke this device's actual
+				// lifecycle reset before the guest can issue terminal R.
+				mpSIOInterface->SendData(mScheduledReply.data() + 2,
+					static_cast<uint32>(payload_bytes), true);
+				FN_LOGI(kAcceptanceTag, "fault: public File P READY triggered embedded ColdReset");
+				ColdReset();
+			} else {
 			const bool interruptPublicTerminalR = mPublicAcceptanceInterruptTerminalR &&
 				mPublicAcceptanceInterruptTerminalRArmed &&
 				!mPublicAcceptanceInterruptTerminalRInjected && mActiveNioCommand == 'R';
@@ -816,6 +857,7 @@ void ATDeviceFujiNetNIO::SendResult(const fujinet::io::AtariSioNioFrontend::Resu
 					mpSIOInterface->SendData(mScheduledReply.data() + 2,
 						static_cast<uint32>(payload_bytes), true);
 				}
+			}
 			}
 		}
 	}
