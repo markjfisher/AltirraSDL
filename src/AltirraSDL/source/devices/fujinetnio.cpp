@@ -52,6 +52,9 @@ static constexpr const char *kTag = "altirra-fn";
 static constexpr const char *kAcceptanceTag = "atari-public-acceptance";
 static constexpr std::uint64_t kAcceptanceClockUnixSeconds = 0x0102030405060708ULL;
 static constexpr const char *kAcceptanceNetworkUri = "fixture://nio-accept";
+static constexpr const char *kResidentOpenFixtureUri = "fixture://resident-open";
+static constexpr const char *kResidentWriteFixtureUri = "fixture://resident-write";
+static constexpr const char *kResidentPostFixtureUri = "fixture://resident-post";
 static constexpr const char *kAcceptanceNetworkWrite = "NET-WRITE-24";
 static constexpr const char *kAcceptanceNetworkReply = "NET-REPLY-24";
 static constexpr const char *kAcceptanceDiskPath = "/fnaccept-disk.atr";
@@ -140,64 +143,139 @@ struct PublicAcceptanceNetworkState {
 	std::uint32_t opens{};
 	std::uint32_t writes{};
 	std::uint32_t closes{};
-	std::vector<std::uint8_t> lastWrite;
+	std::vector<std::uint8_t> last_write;
+	std::vector<std::uint8_t> resident_pending;
+	std::uint32_t resident_expected_commit_offset{};
+	std::uint32_t resident_commits{};
 };
 
+// This is a deterministic protocol backend registered with the production
+// NetworkDevice. It is deliberately not a replacement device or a protocol
+// transport: the normal NetworkDevice parses all requests, owns the handle,
+// and dispatches to this implementation through ProtocolRegistry.
 class PublicAcceptanceNetworkProtocol final : public fujinet::io::INetworkProtocol {
 public:
 	explicit PublicAcceptanceNetworkProtocol(std::shared_ptr<PublicAcceptanceNetworkState> state)
-		: mState(std::move(state)) {}
+		: _state(std::move(state))
+	{}
 
-	fujinet::io::StatusCode open(const fujinet::io::NetworkOpenRequest& request) override {
-		++mState->opens;
+	fujinet::io::StatusCode open(const fujinet::io::NetworkOpenRequest& request) override
+	{
+		++_state->opens;
 		FN_LOGI(kAcceptanceTag, "Network fixture open count=%u method=%u url=%s",
-			mState->opens, static_cast<unsigned>(request.method), request.url.c_str());
-		return request.method == 2 && request.url == kAcceptanceNetworkUri
+				_state->opens, static_cast<unsigned>(request.method), request.url.c_str());
+		const bool public_acceptance_open = request.method == 2 && request.url == kAcceptanceNetworkUri;
+		const bool resident_open = request.method == 1 &&
+			(request.url == kResidentOpenFixtureUri || request.url == "FIXTURE://RESIDENT-OPEN");
+		const bool resident_write = request.method == 3 &&
+			(request.url == kResidentWriteFixtureUri || request.url == "FIXTURE://RESIDENT-WRITE");
+		const bool resident_post = request.method == 2 && request.flags == 4 && request.url == kResidentPostFixtureUri;
+		_resident_post = resident_post;
+		if (resident_open) {
+			FN_LOGI(kAcceptanceTag, "Resident N: fixture accepted GET open");
+		}
+		if (resident_write) {
+			FN_LOGI(kAcceptanceTag, "Resident N: fixture accepted PUT open");
+			FN_LOGI(kAcceptanceTag, "Resident N: PUT flags=%02x", static_cast<unsigned>(request.flags));
+		}
+		if (resident_post) {
+			FN_LOGI(kAcceptanceTag, "Resident N: fixture accepted POST open flags=04");
+		}
+		return public_acceptance_open || resident_open || resident_write || resident_post
 			? fujinet::io::StatusCode::Ok : fujinet::io::StatusCode::InvalidRequest;
 	}
 
 	fujinet::io::StatusCode write_body(std::uint32_t offset,
-		const std::uint8_t* data, std::size_t length, std::uint16_t& written) override {
-		++mState->writes;
-		mState->lastWrite.assign(data, data + length);
-		const bool valid = offset == 0 && length == std::strlen(kAcceptanceNetworkWrite) &&
-			std::equal(mState->lastWrite.begin(), mState->lastWrite.end(),
-				kAcceptanceNetworkWrite);
-		FN_LOGI(kAcceptanceTag, "Network fixture write count=%u bytes=%u valid=%u",
-			mState->writes, static_cast<unsigned>(length), valid ? 1u : 0u);
+									   const std::uint8_t* data,
+									   std::size_t length,
+									   std::uint16_t& written) override
+	{
+		++_state->writes;
+		_state->last_write.assign(data, data + length);
+		bool resident_write = offset == 0 && length == 128;
+		for (std::size_t i = 0; resident_write && i < length; ++i) {
+			resident_write = _state->last_write[i] == static_cast<std::uint8_t>('A');
+		}
+		const bool resident_partial = offset == 0 && length == 3 &&
+			_state->last_write == std::vector<std::uint8_t>{'B', 'C', 'D'};
+		const bool basic_partial = offset == 0 &&
+			_state->last_write == std::vector<std::uint8_t>{'B', 'C', 'D', 0x9b};
+		const bool basic_boundary = offset == 0 && length == 128 &&
+			_state->last_write.back() == 0x9b &&
+			std::all_of(_state->last_write.begin(), _state->last_write.end() - 1,
+						[](std::uint8_t byte) { return byte == 'A'; });
+		const bool basic_post = _resident_post && offset == 0 &&
+			_state->last_write == std::vector<std::uint8_t>{'P', 'O', 'S', 'T', 0x9b};
+		if (resident_write || resident_partial || basic_partial || basic_boundary || basic_post) {
+			_state->resident_pending = _state->last_write;
+			_state->resident_expected_commit_offset = static_cast<std::uint32_t>(length);
+		}
+		const bool resident_commit = length == 0 && !_state->resident_pending.empty() &&
+			offset == _state->resident_expected_commit_offset;
+		if (resident_commit) {
+			++_state->resident_commits;
+			FN_LOGI(kAcceptanceTag, "Resident N: fixture committed body count=%u bytes=%u",
+					_state->resident_commits,
+					static_cast<unsigned>(_state->resident_pending.size()));
+			_state->resident_pending.clear();
+			_state->resident_expected_commit_offset = 0;
+		}
+		const bool valid = resident_write || resident_partial || basic_partial || basic_boundary || basic_post || resident_commit ||
+			(offset == 0 && length == std::strlen(kAcceptanceNetworkWrite) &&
+			std::equal(_state->last_write.begin(), _state->last_write.end(),
+					   kAcceptanceNetworkWrite));
+		if (!_resident_post && _state->last_write == std::vector<std::uint8_t>(kAcceptanceNetworkWrite, kAcceptanceNetworkWrite + std::strlen(kAcceptanceNetworkWrite)))
+			FN_LOGI(kAcceptanceTag, "Network fixture write count=%u bytes=%u valid=%u", _state->writes, static_cast<unsigned>(length), valid ? 1u : 0u);
+		FN_LOGI(kAcceptanceTag, "Network fixture write count=%u offset=%u bytes=%u first=%02x second=%02x last=%02x valid=%u",
+				_state->writes, static_cast<unsigned>(offset), static_cast<unsigned>(length),
+				length ? _state->last_write.front() : 0u,
+				length > 1 ? _state->last_write[1] : 0u,
+				length ? _state->last_write.back() : 0u, valid ? 1u : 0u);
 		written = valid ? static_cast<std::uint16_t>(length) : 0;
 		return valid ? fujinet::io::StatusCode::Ok : fujinet::io::StatusCode::InvalidRequest;
 	}
 
-	fujinet::io::StatusCode read_body(std::uint32_t offset, std::uint8_t* out,
-		std::size_t capacity, std::uint16_t& read, bool& eof, bool& moreAvailable) override {
-		const std::size_t replyLength = std::strlen(kAcceptanceNetworkReply);
-		if (offset > replyLength)
+	fujinet::io::StatusCode read_body(std::uint32_t offset,
+									  std::uint8_t* out,
+									  std::size_t capacity,
+									  std::uint16_t& read,
+									  bool& eof,
+									  bool& more_available) override
+	{
+		if (_resident_post) {
+			FN_LOGI(kAcceptanceTag, "Resident N: POST response read offset=%u commits=%u", static_cast<unsigned>(offset), _state->resident_commits);
+			if (_state->resident_commits != 1 || offset != 0) return fujinet::io::StatusCode::InvalidRequest;
+		}
+		if (offset > std::strlen(kAcceptanceNetworkReply)) {
 			return fujinet::io::StatusCode::InvalidRequest;
-		const std::size_t available = replyLength - static_cast<std::size_t>(offset);
+		}
+		const std::size_t available = std::strlen(kAcceptanceNetworkReply) - static_cast<std::size_t>(offset);
 		const std::size_t count = std::min(available, capacity);
 		std::copy_n(reinterpret_cast<const std::uint8_t*>(kAcceptanceNetworkReply) + offset,
-			count, out);
+					count, out);
 		read = static_cast<std::uint16_t>(count);
 		eof = count == available;
-		moreAvailable = !eof;
+		more_available = !eof;
 		return fujinet::io::StatusCode::Ok;
 	}
 
-	fujinet::io::StatusCode info(fujinet::io::NetworkInfo& out) override {
+	fujinet::io::StatusCode info(fujinet::io::NetworkInfo& out) override
+	{
 		out = fujinet::io::NetworkInfo{};
 		return fujinet::io::StatusCode::Ok;
 	}
 
 	void poll() override {}
 
-	void close() override {
-		++mState->closes;
-		FN_LOGI(kAcceptanceTag, "Network fixture close count=%u", mState->closes);
+	void close() override
+	{
+		++_state->closes;
+		FN_LOGI(kAcceptanceTag, "Network fixture close count=%u", _state->closes);
 	}
 
 private:
-	std::shared_ptr<PublicAcceptanceNetworkState> mState;
+	std::shared_ptr<PublicAcceptanceNetworkState> _state;
+	bool _resident_post = false;
 };
 
 class PublicAcceptanceRoute final : public fujinet::io::IRequestHandler {
