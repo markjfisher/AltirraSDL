@@ -24,5 +24,5 @@ target_link_libraries(altirra-fujinet-nio-sio-test PRIVATE
 
 add_test(NAME altirra-fujinet-nio-sio
     COMMAND altirra-fujinet-nio-sio-test
-            ${PROJECT_SOURCE_DIR}/../../integration-tests/atari-sio/fixtures/nio_v1.json)
+            ${ALTIRRA_FUJINET_NIO_SOURCE_DIR}/tests/fixtures/atari-sio/nio_v1.json)
 set_tests_properties(altirra-fujinet-nio-sio PROPERTIES TIMEOUT 60)
