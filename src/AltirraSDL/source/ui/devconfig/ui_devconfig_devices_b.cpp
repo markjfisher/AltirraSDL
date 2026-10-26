@@ -262,6 +262,33 @@ bool RenderHostFSConfig(ATPropertySet& props, ATDeviceConfigState& st) {
 }
 
 // =========================================================================
+// FujiNet-NIO — config directory
+// =========================================================================
+
+bool RenderFujiNetNIOConfig(ATPropertySet& props, ATDeviceConfigState& st) {
+	if (st.justOpened) {
+		const wchar_t *path = props.GetString("configdir", L"./fujinet-data");
+		snprintf(st.pathBuf, sizeof(st.pathBuf), "%s", WToU8(path).c_str());
+	}
+
+	if (InputTextWithBrowse("Config directory", st.pathBuf, sizeof(st.pathBuf), "browseFujiNetNIO"))
+		DevBrowseForFolder(st.pathBuf, sizeof(st.pathBuf));
+	ImGui::SetItemTooltip("Directory containing fujinet.yaml and local FujiNet data");
+
+	ImGui::Separator();
+	if (ImGui::Button("OK", ImVec2(120, 0))) {
+		props.Clear();
+		props.SetString("configdir", U8ToW(st.pathBuf[0] ? st.pathBuf : "./fujinet-data").c_str());
+		return true;
+	}
+	ImGui::SameLine();
+	if (ImGui::Button("Cancel", ImVec2(120, 0)))
+		g_devCfg.Reset();
+
+	return false;
+}
+
+// =========================================================================
 // Custom Device — script path + options
 // =========================================================================
 

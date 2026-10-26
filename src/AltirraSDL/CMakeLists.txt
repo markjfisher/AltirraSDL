@@ -642,6 +642,38 @@ if(NOT WIN32)
 endif()
 
 # ---------------------------------------------------------------------------
+# FujiNet-NIO embedded SIO device
+# ---------------------------------------------------------------------------
+# Optional: embeds the fujinet-nio firmware library as an Atari SIO device.
+# Configure with -DALTIRRA_FUJINET_NIO=ON and point
+# ALTIRRA_FUJINET_NIO_SOURCE_DIR at a fujinet-nio source tree.
+option(ALTIRRA_FUJINET_NIO "Build the embedded FujiNet-NIO SIO device" OFF)
+set(ALTIRRA_FUJINET_NIO_SOURCE_DIR "" CACHE PATH "Path to the fujinet-nio source tree")
+
+if(ALTIRRA_FUJINET_NIO)
+    if(EXISTS "${ALTIRRA_FUJINET_NIO_SOURCE_DIR}/CMakeLists.txt")
+        # Embed the reduced library only. Plain variables, so the user's cache
+        # is left alone; fujinet-nio's option() calls honour them (CMP0077).
+        set(FN_BUILD_POSIX_APP OFF)
+        set(FN_BUILD_TESTS OFF)
+        set(FN_BUILD_EMBEDDED_LIB ON)
+        # Defaults the user can override with -DFN_WITH_CURL=OFF etc.
+        set(FN_WITH_CURL ON CACHE BOOL "Enable libcurl-backed HTTP/HTTPS on POSIX")
+        set(FN_WITH_OPENSSL ON CACHE BOOL "Enable OpenSSL-backed TLS on POSIX")
+
+        add_subdirectory("${ALTIRRA_FUJINET_NIO_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/fujinet-nio" EXCLUDE_FROM_ALL)
+
+        target_sources(AltirraSDL PRIVATE
+            source/devices/fujinetnio.cpp
+        )
+        target_compile_definitions(AltirraSDL PRIVATE ALTIRRA_FUJINET_NIO=1)
+        target_link_libraries(AltirraSDL PRIVATE fujinet-nio)
+    else()
+        message(WARNING "ALTIRRA_FUJINET_NIO is ON but ALTIRRA_FUJINET_NIO_SOURCE_DIR does not contain fujinet-nio; embedded device disabled.")
+    endif()
+endif()
+
+# ---------------------------------------------------------------------------
 # Window/taskbar icon
 # ---------------------------------------------------------------------------
 # Bake the Android launcher PNGs into:
