@@ -658,6 +658,7 @@ bool ATDeviceFujiNetNIO::InitCore() {
 	fujinet::core::register_file_device(mCore);
 	fujinet::core::register_clock_device(mCore, fujiConcrete->config_store());
 	fujinet::core::register_disk_device(mCore);
+	fujinet::core::register_application_state_services(mCore);
 
 	const auto diskDeviceId = to_device_id(WireDeviceId::DiskService);
 	auto *diskDev = dynamic_cast<fujinet::io::DiskDevice *>(mCore.deviceManager().getDevice(diskDeviceId));
